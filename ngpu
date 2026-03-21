@@ -1,4 +1,4 @@
-!/usr/bin/env bash
+#!/usr/bin/env bash
 # ngpu — 自动选择空闲 GPU 并运行命令
 #
 # 用法：
