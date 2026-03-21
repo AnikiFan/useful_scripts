@@ -1,0 +1,171 @@
+!/usr/bin/env bash
+# ngpu — 自动选择空闲 GPU 并运行命令
+#
+# 用法：
+#   ngpu [数量] [选项] <命令> [参数...]
+#
+# 示例：
+#   ngpu 2 python train.py
+#   ngpu python train.py          # 默认选 1 块
+#   ngpu 0 python train.py        # CPU only
+#   ngpu 2 --warn python train.py # 不够时只警告不退出
+#   ngpu 2 --dry  python train.py # 只看选哪几块，不实际运行
+#   ngpu 2 --mem 1000 python ...  # 显存阈值调整为 1000MB
+#   ngpu 2 --util 5   python ...  # 利用率阈值调整为 5%
+#
+# 环境变量（可在 ~/.zshrc 中设置永久默认值）：
+#   GPU_MEM_THRESHOLD   显存阈值 MB（默认 500）
+#   GPU_UTIL_THRESHOLD  利用率阈值 %（默认 10）
+
+set -euo pipefail
+
+# ---------- 默认配置 ----------
+MEM_MB=${GPU_MEM_THRESHOLD:-500}
+UTIL=${GPU_UTIL_THRESHOLD:-10}
+N=1
+STRICT=1
+DRY=0
+# ------------------------------
+
+die()  { echo "[ngpu] 错误：$*" >&2; exit 1; }
+warn() { echo "[ngpu] ⚠️  $*" >&2; }
+info() { echo "[ngpu] $*" >&2; }
+
+check_nvidia_smi() {
+    command -v nvidia-smi &>/dev/null || die "未找到 nvidia-smi，请确认已安装 NVIDIA 驱动。"
+}
+
+# 查询所有 GPU 信息，输出格式：index|name|mem_used|mem_total|util|uuid
+get_gpu_rows() {
+    nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu,uuid \
+               --format=csv,noheader,nounits 2>/dev/null \
+    | sed 's/, */|/g'
+}
+
+# 查询每个 GPU 的 compute 进程数，输出 "uuid count" 行
+get_proc_counts() {
+    nvidia-smi --query-compute-apps=gpu_uuid,pid \
+               --format=csv,noheader,nounits 2>/dev/null \
+    | awk -F', *' '{count[$1]++} END {for (u in count) print u, count[u]}'
+}
+
+print_status() {
+    local selected="$1"; shift
+    local -a rows=("$@")
+
+    info "GPU 状态（共 ${#rows[@]} 张）："
+
+    declare -A proc_map
+    while read -r uuid cnt; do
+        proc_map["$uuid"]=$cnt
+    done < <(get_proc_counts)
+
+    for row in "${rows[@]}"; do
+        IFS='|' read -r idx name mem_used mem_total util uuid <<< "$row"
+        local procs=${proc_map["$uuid"]:-0}
+
+        local mark
+        if echo " $selected " | grep -qw "$idx"; then
+            mark="✓"
+        elif [[ $procs -eq 0 ]]; then
+            mark="○"
+        else
+            mark="✗"
+        fi
+
+        local filled=$(( mem_used * 10 / mem_total ))
+        local bar=""
+        for (( i=0; i<10; i++ )); do
+            [[ $i -lt $filled ]] && bar+="█" || bar+="░"
+        done
+
+        printf "  [%s] GPU %s  %-22s  %s  %5d/%dMB  %3d%%  进程:%d\n" \
+               "$mark" "$idx" "$name" "$bar" "$mem_used" "$mem_total" "$util" "$procs" >&2
+    done
+}
+
+# 筛选空闲 GPU，按显存升序输出编号
+find_free_gpus() {
+    local -a rows=("$@")
+
+    declare -A proc_map
+    while read -r uuid cnt; do
+        proc_map["$uuid"]=$cnt
+    done < <(get_proc_counts)
+
+    local free_list=""
+    for row in "${rows[@]}"; do
+        IFS='|' read -r idx name mem_used mem_total util uuid <<< "$row"
+        local procs=${proc_map["$uuid"]:-0}
+        if [[ $procs -eq 0 && $mem_used -lt $MEM_MB && $util -lt $UTIL ]]; then
+            free_list+="$mem_used $idx\n"
+        fi
+    done
+
+    echo -e "$free_list" | sort -n | awk '{print $2}' | grep -v '^$' || true
+}
+
+# ---------- 解析参数 ----------
+[[ $# -eq 0 ]] && { grep '^#' "$0" | sed 's/^# \?//'; exit 0; }
+
+if [[ $1 =~ ^[0-9]+$ ]]; then
+    N=$1; shift
+fi
+
+while [[ $# -gt 0 && $1 == --* ]]; do
+    case $1 in
+        --mem)   MEM_MB=$2; shift 2 ;;
+        --util)  UTIL=$2;   shift 2 ;;
+        --warn)  STRICT=0;  shift   ;;
+        --dry)   DRY=1;     shift   ;;
+        *)       break ;;
+    esac
+done
+
+[[ $# -eq 0 ]] && die "请提供要运行的命令。\n用法：gpu [数量] [选项] <命令> [参数...]"
+
+check_nvidia_smi
+
+# ---------- CPU only ----------
+if [[ $N -eq 0 ]]; then
+    info "使用 CPU（CUDA_VISIBLE_DEVICES=\"\"）"
+    export CUDA_VISIBLE_DEVICES=""
+    [[ $DRY -eq 1 ]] && { info "--dry 模式，命令：$*"; exit 0; }
+    exec "$@"
+fi
+
+# ---------- 查询 GPU ----------
+mapfile -t GPU_ROWS < <(get_gpu_rows)
+[[ ${#GPU_ROWS[@]} -eq 0 ]] && die "未检测到任何 GPU。"
+
+mapfile -t FREE_INDICES < <(find_free_gpus "${GPU_ROWS[@]}")
+FREE_COUNT=${#FREE_INDICES[@]}
+
+# ---------- 检查空闲数量 ----------
+if [[ $FREE_COUNT -lt $N ]]; then
+    print_status "" "${GPU_ROWS[@]}"
+    msg="需要 ${N} 块空闲 GPU，当前只有 ${FREE_COUNT} 块空闲 [${FREE_INDICES[*]:-无}]。"
+    if [[ $STRICT -eq 1 ]]; then
+        die "$msg"$'\n'"       可用 --warn 选项在空闲不足时降级运行，或等待其他用户释放资源。"
+    else
+        warn "$msg 降级使用现有空闲 GPU。"
+        [[ $FREE_COUNT -eq 0 ]] && die "没有任何空闲 GPU，无法运行。"
+        SELECTED=("${FREE_INDICES[@]}")
+    fi
+else
+    SELECTED=("${FREE_INDICES[@]:0:$N}")
+fi
+
+# ---------- 打印状态并运行 ----------
+print_status "${SELECTED[*]}" "${GPU_ROWS[@]}"
+
+VISIBLE=$(IFS=,; echo "${SELECTED[*]}")
+info "选用 GPU [${SELECTED[*]}]  →  CUDA_VISIBLE_DEVICES=${VISIBLE}"
+
+if [[ $DRY -eq 1 ]]; then
+    info "--dry 模式，不实际运行命令：$*"
+    exit 0
+fi
+
+export CUDA_VISIBLE_DEVICES="$VISIBLE"
+exec "$@"
