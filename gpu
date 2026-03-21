@@ -1,0 +1,75 @@
+#!/bin/bash
+# 检查是否指定了 GPU_ID
+if [ -z "$1" ]; then
+    echo "[ERROR] GPU_ID must be specified."
+    echo "Usage: $0 <GPU_ID> [cancel|stop|continue|<command>]"
+    exit 1
+fi
+
+GPU_ID=$1
+shift
+ACTION=$1
+SESSION_NAME=GPU${GPU_ID}
+export TS_SOCKET=/tmp/ts_gpu_${GPU_ID}.socket
+LOG_DIR=$HOME/ts_logs/gpu_${GPU_ID}
+mkdir -p ${LOG_DIR}
+
+# cancel: 清空任务并关闭 session
+if [ "$ACTION" = "cancel" ]; then
+    echo "[INFO] Killing all tasks for GPU${GPU_ID}..."
+    ~/bin/ts -C
+    for id in $(~/bin/ts -n | awk '{print $1}' | tail -n +2); do
+        ~/bin/ts -k $id
+    done
+    if tmux has-session -t ${SESSION_NAME} 2>/dev/null; then
+        tmux kill-session -t ${SESSION_NAME}
+        echo "[INFO] tmux session ${SESSION_NAME} closed."
+    fi
+    echo "[INFO] All tasks cleared."
+    exit 0
+fi
+
+# stop: 添加一个无限循环的阻塞任务，并提升优先级
+if [ "$ACTION" = "stop" ]; then
+    echo "[INFO] Adding blocking loop task to pause queue for GPU${GPU_ID}..."
+    BLOCK_ID=$(~/bin/ts -L stop_guard bash -c "while true; do sleep 1000; done")
+    echo "[INFO] Pause task added with ID $BLOCK_ID. Moving to front..."
+    ~/bin/ts -u $BLOCK_ID
+    echo "[INFO] Pause task moved to front."
+    exit 0
+fi
+
+# continue: 移除阻塞任务（标记为 stop_guard）
+if [ "$ACTION" = "continue" ]; then
+    echo "[INFO] Trying to remove blocking pause task for GPU${GPU_ID}..."
+    STOP_ID=$(~/bin/ts -n | grep stop_guard | awk '{print $1}')
+    if [ -n "$STOP_ID" ]; then
+        ~/bin/ts -k $STOP_ID
+        echo "[INFO] Removed blocking task ID $STOP_ID."
+    else
+        echo "[INFO] No blocking task found."
+    fi
+    exit 0
+fi
+
+# 其他情况：视为正常任务
+shift
+TASK_CMD="$ACTION $@"
+LOG_FILE=${LOG_DIR}/$(date '+%Y%m%d_%H%M%S').log
+
+# 创建tmux session及window (如不存在)
+if ! tmux has-session -t ${SESSION_NAME} 2>/dev/null; then
+    tmux new-session -d -s ${SESSION_NAME} -n TASK_OUTPUT "bash"
+    tmux new-window -t ${SESSION_NAME}:1 -n TS_STATUS bash -c "export TS_SOCKET=${TS_SOCKET}; sleep 1; ts | less"
+    tmux new-window -t ${SESSION_NAME}:2 -n NVIDIA_SMI "watch -n 1 nvidia-smi"
+fi
+
+# 提交任务到ts队列（任务启动时再重启窗口和日志监控）
+~/bin/ts bash -c "export CUDA_VISIBLE_DEVICES=${GPU_ID}; \
+    echo ${LOG_FILE} > ${LOG_DIR}/current_log_path.txt; \
+    touch ${LOG_FILE}; \
+    tmux kill-window -t ${SESSION_NAME}:TASK_OUTPUT >/dev/null 2>&1; \
+    tmux new-window -t ${SESSION_NAME}:0 -n TASK_OUTPUT \"export TS_SOCKET=${TS_SOCKET};tail -F -n +1 ${LOG_FILE}\"; \
+    echo \"[任务启动于 $(date '+%Y-%m-%d %H:%M:%S')] ${TASK_CMD}\" >> ${LOG_FILE}; \
+    eval \"${TASK_CMD}\" >> ${LOG_FILE} 2>&1; \
+"
