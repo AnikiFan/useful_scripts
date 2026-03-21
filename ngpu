@@ -84,7 +84,7 @@ print_status() {
     done
 }
 
-# 筛选空闲 GPU，按显存升序输出编号
+# 筛选空闲 GPU，按空余显存降序输出编号（空余最多的排最前）
 find_free_gpus() {
     local -a rows=("$@")
 
@@ -98,11 +98,12 @@ find_free_gpus() {
         IFS='|' read -r idx name mem_used mem_total util uuid <<< "$row"
         local procs=${proc_map["$uuid"]:-0}
         if [[ $procs -eq 0 && $mem_used -lt $MEM_MB && $util -lt $UTIL ]]; then
-            free_list+="$mem_used $idx\n"
+            local mem_free=$(( mem_total - mem_used ))
+            free_list+="$mem_free $idx\n"
         fi
     done
 
-    echo -e "$free_list" | sort -n | awk '{print $2}' | grep -v '^$' || true
+    echo -e "$free_list" | sort -rn | awk '{print $2}' | grep -v '^$' || true
 }
 
 # ---------- 解析参数 ----------
