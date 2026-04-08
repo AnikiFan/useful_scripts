@@ -8,17 +8,17 @@ if [[ $# -eq 2 ]]; then
     if command -v code &>/dev/null; then
         exec code --wait --diff "$1" "$2"
     elif command -v nvim &>/dev/null; then
-        exec nvim -d "$1" "$2" </dev/tty
+        exec nvim -d "$1" "$2" </dev/tty >/dev/tty
     else
-        exec vim -d "$1" "$2" </dev/tty
+        exec vim -d "$1" "$2" </dev/tty >/dev/tty
     fi
 else
     # edit mode
     if command -v code &>/dev/null; then
         exec code --wait "$@"
     elif command -v nvim &>/dev/null; then
-        exec nvim "$@" </dev/tty
+        exec nvim "$@" </dev/tty >/dev/tty
     else
-        exec vim "$@" </dev/tty
+        exec vim "$@" </dev/tty >/dev/tty
     fi
 fi
