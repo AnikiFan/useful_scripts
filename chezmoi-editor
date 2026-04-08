@@ -1,0 +1,24 @@
+  #!/bin/bash
+  # Runtime fallback editor/diff tool for chezmoi.
+  # Called with 1 arg for edit mode, 2 args for diff/merge mode.
+  set -euo pipefail
+
+  if [[ $# -eq 2 ]]; then
+      # diff / merge mode
+      if command -v code &>/dev/null; then
+          exec code --wait --diff "$1" "$2"
+      elif command -v nvim &>/dev/null; then
+          exec nvim -d "$1" "$2"
+      else
+          exec vim -d "$1" "$2"
+      fi
+  else
+      # edit mode
+      if command -v code &>/dev/null; then
+          exec code --wait "$@"
+      elif command -v nvim &>/dev/null; then
+          exec nvim "$@"
+      else
+          exec vim "$@"
+      fi
+  fi
