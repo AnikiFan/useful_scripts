@@ -30,6 +30,7 @@ LOG_TAG="user-disk-monitor"
 SEND_ADMIN_COPY=true
 ADMIN_EMAIL="your_email@example.com"
 MSMTP_BIN="msmtp"
+MSMTP_RUN_USER=""
 CONFIRM_BEFORE_SEND=true
 
 usage() {
@@ -50,6 +51,7 @@ usage() {
         "      --admin-copy             同时给管理员发送副本，默认开启" \
         "      --no-admin-copy          不给管理员发送副本" \
         "      --msmtp-bin PATH         msmtp 命令路径，默认：${MSMTP_BIN}" \
+        "      --msmtp-run-user USER    使用指定系统用户执行 msmtp，默认使用当前用户" \
         "      --confirm               发送前要求用户确认，默认开启" \
         "      --no-confirm            发送前不要求用户确认" \
         "  -h, --help                   显示帮助"
@@ -119,6 +121,11 @@ while (($# > 0)); do
             MSMTP_BIN="$2"
             shift 2
             ;;
+        --msmtp-run-user)
+            (($# >= 2)) || die "$1 需要一个参数"
+            MSMTP_RUN_USER="$2"
+            shift 2
+            ;;
         --confirm)
             CONFIRM_BEFORE_SEND=true
             shift
@@ -149,6 +156,10 @@ done
 
 if ! command -v "$MSMTP_BIN" >/dev/null 2>&1; then
     die "缺少 msmtp 命令：${MSMTP_BIN}"
+fi
+
+if [[ -n "$MSMTP_RUN_USER" ]] && ! command -v sudo >/dev/null 2>&1; then
+    die "指定了 --msmtp-run-user，但缺少 sudo 命令"
 fi
 
 mkdir -p "$STATE_DIR"
@@ -192,9 +203,14 @@ send_alert() {
 
     local recipients=("$recipient")
     local msmtp_args=()
+    local msmtp_command=("$MSMTP_BIN")
 
     if [[ -n "$MSMTP_CONFIG" ]]; then
         msmtp_args+=(--file="$MSMTP_CONFIG")
+    fi
+
+    if [[ -n "$MSMTP_RUN_USER" ]]; then
+        msmtp_command=(sudo -u "$MSMTP_RUN_USER" -- "$MSMTP_BIN")
     fi
 
     if [[ "$SEND_ADMIN_COPY" == true ]] &&
@@ -243,7 +259,7 @@ send_alert() {
         echo "祝您工作顺利。"
         echo
         echo "此邮件由服务器磁盘监控程序自动发送。"
-    } | "$MSMTP_BIN" \
+    } | "${msmtp_command[@]}" \
         "${msmtp_args[@]}" \
         "${recipients[@]}"
 }
