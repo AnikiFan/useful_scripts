@@ -1,25 +1,119 @@
 #!/usr/bin/env bash
 
 set -u
+set -o pipefail
 
-# 要监控的分区
+DESCRIPTION='
+check_disk_space
+
+监控指定挂载点的剩余空间。当可用空间低于阈值时发送邮件告警，并使用状态文件避免重复发送。
+当空间恢复到阈值以上后，状态文件会被清除，之后再次低于阈值时会重新告警。
+
+示例：
+  check_disk_space --mount-point / --threshold-gb 50 --recipient admin@example.com
+  check_disk_space -m /data -t 200 -r ops@example.com --state-file /var/lib/disk-alert/data.alerted
+'
+
 MOUNT_POINT="/"
-
-# 剩余空间阈值，单位为 GB
 THRESHOLD_GB=50
-
-# 收件邮箱
 RECIPIENT="xiaofan140@gmail.com"
-
-# 告警状态文件，用于避免重复发送
 STATE_FILE="${HOME}/.disk_space_alert_sent"
+LOG_TAG="disk-monitor"
+MSMTP_BIN="msmtp"
 
-# 主机信息
+usage() {
+    printf '%s\n' "$DESCRIPTION"
+    printf '%s\n' \
+        "用法：" \
+        "  check_disk_space [选项]" \
+        "" \
+        "选项：" \
+        "  -m, --mount-point PATH    要监控的挂载点，默认：${MOUNT_POINT}" \
+        "  -t, --threshold-gb GB     剩余空间告警阈值，单位 GB，默认：${THRESHOLD_GB}" \
+        "  -r, --recipient EMAIL     告警收件邮箱，默认：${RECIPIENT}" \
+        "  -s, --state-file PATH     告警状态文件，默认：${STATE_FILE}" \
+        "      --log-tag TAG         syslog 日志标识，默认：${LOG_TAG}" \
+        "      --msmtp-bin PATH      msmtp 命令路径，默认：${MSMTP_BIN}" \
+        "  -h, --help                显示帮助"
+}
+
+die() {
+    echo "错误：$*" >&2
+    exit 1
+}
+
+is_positive_integer() {
+    [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]
+}
+
+while (($# > 0)); do
+    case "$1" in
+        -m|--mount-point)
+            (($# >= 2)) || die "$1 需要一个参数"
+            MOUNT_POINT="$2"
+            shift 2
+            ;;
+        -t|--threshold-gb)
+            (($# >= 2)) || die "$1 需要一个参数"
+            THRESHOLD_GB="$2"
+            shift 2
+            ;;
+        -r|--recipient)
+            (($# >= 2)) || die "$1 需要一个参数"
+            RECIPIENT="$2"
+            shift 2
+            ;;
+        -s|--state-file)
+            (($# >= 2)) || die "$1 需要一个参数"
+            STATE_FILE="$2"
+            shift 2
+            ;;
+        --log-tag)
+            (($# >= 2)) || die "$1 需要一个参数"
+            LOG_TAG="$2"
+            shift 2
+            ;;
+        --msmtp-bin)
+            (($# >= 2)) || die "$1 需要一个参数"
+            MSMTP_BIN="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "未知参数：$1。使用 --help 查看帮助"
+            ;;
+    esac
+done
+
+is_positive_integer "$THRESHOLD_GB" || die "--threshold-gb 必须是正整数"
+[[ -n "$RECIPIENT" ]] || die "--recipient 不能为空"
+[[ -d "$MOUNT_POINT" ]] || die "挂载点不存在：${MOUNT_POINT}"
+
+for command_name in df tail tr hostname date logger dirname mkdir; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        die "缺少命令：${command_name}"
+    fi
+done
+
+if ! command -v "$MSMTP_BIN" >/dev/null 2>&1; then
+    die "缺少 msmtp 命令：${MSMTP_BIN}"
+fi
+
+STATE_PARENT="$(dirname "$STATE_FILE")"
+mkdir -p "$STATE_PARENT"
+
 HOSTNAME_VALUE="$(hostname)"
 CURRENT_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
-# 获取可供普通用户使用的剩余空间，单位为字节
-AVAILABLE_BYTES="$(df -B1 --output=avail "$MOUNT_POINT" | tail -n 1 | tr -d ' ')"
+AVAILABLE_BYTES="$(df -B1 --output=avail "$MOUNT_POINT" | tail -n 1 | tr -d '[:space:]')"
+
+if [[ ! "$AVAILABLE_BYTES" =~ ^[0-9]+$ ]]; then
+    logger -t "$LOG_TAG" "Unable to get available disk space for ${MOUNT_POINT}"
+    exit 1
+fi
 
 THRESHOLD_BYTES=$((THRESHOLD_GB * 1024 * 1024 * 1024))
 AVAILABLE_GB=$((AVAILABLE_BYTES / 1024 / 1024 / 1024))
@@ -29,8 +123,9 @@ send_alert() {
         echo "Subject: [Disk Alert] ${HOSTNAME_VALUE} 系统盘空间不足"
         echo "From: Linux Disk Monitor"
         echo "To: ${RECIPIENT}"
+        echo "Content-Type: text/plain; charset=UTF-8"
         echo
-        echo "服务器系统盘剩余空间已低于设定阈值。"
+        echo "服务器磁盘剩余空间已低于设定阈值。"
         echo
         echo "主机：${HOSTNAME_VALUE}"
         echo "分区：${MOUNT_POINT}"
@@ -40,26 +135,24 @@ send_alert() {
         echo
         echo "磁盘使用情况："
         df -h "$MOUNT_POINT"
-    } | msmtp "$RECIPIENT"
+    } | "$MSMTP_BIN" "$RECIPIENT"
 }
 
 if (( AVAILABLE_BYTES < THRESHOLD_BYTES )); then
-    # 之前没有发送过告警时才发邮件
     if [[ ! -f "$STATE_FILE" ]]; then
         if send_alert; then
             touch "$STATE_FILE"
-            logger -t disk-monitor \
+            logger -t "$LOG_TAG" \
                 "Disk alert sent: ${MOUNT_POINT} has ${AVAILABLE_GB} GB available"
         else
-            logger -t disk-monitor "Failed to send disk alert"
+            logger -t "$LOG_TAG" "Failed to send disk alert"
             exit 1
         fi
     fi
 else
-    # 空间恢复后清除状态，下次空间不足时可以重新告警
     if [[ -f "$STATE_FILE" ]]; then
         rm -f "$STATE_FILE"
-        logger -t disk-monitor \
+        logger -t "$LOG_TAG" \
             "Disk space recovered: ${MOUNT_POINT} has ${AVAILABLE_GB} GB available"
     fi
 fi

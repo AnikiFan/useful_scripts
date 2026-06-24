@@ -3,43 +3,148 @@
 set -u
 set -o pipefail
 
-# ==================== 配置区域 ====================
+DESCRIPTION='
+check_user_disk_usage
 
-# 系统盘挂载点
+扫描用户目录，找出同时满足以下条件的用户并发送邮件告警：
+1. 用户目录占用空间大于系统盘当前可用空间
+2. 用户目录占用空间大于最低告警阈值
+
+脚本通过状态目录记录已告警用户，避免重复发送。用户不再满足告警条件后，状态文件会被清除。
+用户名与邮箱映射文件格式为每行一个 username=email@example.com。
+
+示例：
+  check_user_disk_usage --mount-point / --home-root /home --min-usage-gb 100 \
+    --email-map-file /etc/disk-user-emails.conf --admin-email ops@example.com
+
+  check_user_disk_usage --no-admin-copy --msmtp-config /root/.msmtprc
+'
+
 MOUNT_POINT="/"
-
-# 用户目录所在位置
 HOME_ROOT="/home"
-
-# 用户占用空间的最低告警阈值，单位 GB
 MIN_USAGE_GB=100
-
-# 用户名与邮箱映射文件
 EMAIL_MAP_FILE="/etc/disk-user-emails.conf"
-
-# msmtp 配置文件
 MSMTP_CONFIG="/root/.msmtprc"
-
-# 告警状态目录，用于避免重复发送
 STATE_DIR="/var/lib/user-disk-alert"
-
-# 日志标识
 LOG_TAG="user-disk-monitor"
-
-# 是否同时给管理员发送副本
 SEND_ADMIN_COPY=true
-
-# 管理员邮箱
 ADMIN_EMAIL="your_email@example.com"
+MSMTP_BIN="msmtp"
 
-# =================================================
+usage() {
+    printf '%s\n' "$DESCRIPTION"
+    printf '%s\n' \
+        "用法：" \
+        "  check_user_disk_usage [选项]" \
+        "" \
+        "选项：" \
+        "  -m, --mount-point PATH       用于判断可用空间的挂载点，默认：${MOUNT_POINT}" \
+        "      --home-root PATH         用户目录根路径，默认：${HOME_ROOT}" \
+        "      --min-usage-gb GB        用户占用空间最低告警阈值，单位 GB，默认：${MIN_USAGE_GB}" \
+        "      --email-map-file PATH    用户名与邮箱映射文件，默认：${EMAIL_MAP_FILE}" \
+        "      --msmtp-config PATH      msmtp 配置文件，默认：${MSMTP_CONFIG}" \
+        "      --state-dir PATH         告警状态目录，默认：${STATE_DIR}" \
+        "      --log-tag TAG            syslog 日志标识，默认：${LOG_TAG}" \
+        "      --admin-email EMAIL      管理员副本邮箱，默认：${ADMIN_EMAIL}" \
+        "      --admin-copy             同时给管理员发送副本，默认开启" \
+        "      --no-admin-copy          不给管理员发送副本" \
+        "      --msmtp-bin PATH         msmtp 命令路径，默认：${MSMTP_BIN}" \
+        "  -h, --help                   显示帮助"
+}
+
+die() {
+    echo "错误：$*" >&2
+    exit 1
+}
+
+is_positive_integer() {
+    [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]
+}
+
+while (($# > 0)); do
+    case "$1" in
+        -m|--mount-point)
+            (($# >= 2)) || die "$1 需要一个参数"
+            MOUNT_POINT="$2"
+            shift 2
+            ;;
+        --home-root)
+            (($# >= 2)) || die "$1 需要一个参数"
+            HOME_ROOT="$2"
+            shift 2
+            ;;
+        --min-usage-gb)
+            (($# >= 2)) || die "$1 需要一个参数"
+            MIN_USAGE_GB="$2"
+            shift 2
+            ;;
+        --email-map-file)
+            (($# >= 2)) || die "$1 需要一个参数"
+            EMAIL_MAP_FILE="$2"
+            shift 2
+            ;;
+        --msmtp-config)
+            (($# >= 2)) || die "$1 需要一个参数"
+            MSMTP_CONFIG="$2"
+            shift 2
+            ;;
+        --state-dir)
+            (($# >= 2)) || die "$1 需要一个参数"
+            STATE_DIR="$2"
+            shift 2
+            ;;
+        --log-tag)
+            (($# >= 2)) || die "$1 需要一个参数"
+            LOG_TAG="$2"
+            shift 2
+            ;;
+        --admin-email)
+            (($# >= 2)) || die "$1 需要一个参数"
+            ADMIN_EMAIL="$2"
+            shift 2
+            ;;
+        --admin-copy)
+            SEND_ADMIN_COPY=true
+            shift
+            ;;
+        --no-admin-copy)
+            SEND_ADMIN_COPY=false
+            shift
+            ;;
+        --msmtp-bin)
+            (($# >= 2)) || die "$1 需要一个参数"
+            MSMTP_BIN="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "未知参数：$1。使用 --help 查看帮助"
+            ;;
+    esac
+done
+
+is_positive_integer "$MIN_USAGE_GB" || die "--min-usage-gb 必须是正整数"
+[[ -d "$MOUNT_POINT" ]] || die "挂载点不存在：${MOUNT_POINT}"
+[[ -d "$HOME_ROOT" ]] || die "用户目录根路径不存在：${HOME_ROOT}"
+
+for command_name in df du numfmt awk logger find basename tail tr hostname date mkdir; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        die "缺少命令：${command_name}"
+    fi
+done
+
+if ! command -v "$MSMTP_BIN" >/dev/null 2>&1; then
+    die "缺少 msmtp 命令：${MSMTP_BIN}"
+fi
 
 mkdir -p "$STATE_DIR"
 
 HOSTNAME_VALUE="$(hostname -f 2>/dev/null || hostname)"
 CURRENT_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
-# 获取系统盘可供普通用户使用的空间，单位为字节
 AVAILABLE_BYTES="$(
     df -B1 --output=avail "$MOUNT_POINT" |
     tail -n 1 |
@@ -75,6 +180,11 @@ send_alert() {
     local home_dir="$5"
 
     local recipients=("$recipient")
+    local msmtp_args=()
+
+    if [[ -n "$MSMTP_CONFIG" ]]; then
+        msmtp_args+=(--file="$MSMTP_CONFIG")
+    fi
 
     if [[ "$SEND_ADMIN_COPY" == true ]] &&
        [[ -n "$ADMIN_EMAIL" ]] &&
@@ -106,6 +216,7 @@ send_alert() {
         echo "用户：${username}"
         echo "用户目录：${home_dir}"
         echo "您的占用空间：${usage_human}"
+        echo "您的占用字节数：${usage_bytes}"
         echo "系统盘当前可用空间：${AVAILABLE_GB} GB"
         echo "最低告警阈值：${MIN_USAGE_GB} GB"
         echo "检测时间：${CURRENT_TIME}"
@@ -116,25 +227,11 @@ send_alert() {
         echo "du -xhd1 '${home_dir}' 2>/dev/null | sort -hr | head -n 20"
         echo
         echo "此邮件由服务器磁盘监控程序自动发送。"
-    } | msmtp \
-        --file="$MSMTP_CONFIG" \
+    } | "$MSMTP_BIN" \
+        "${msmtp_args[@]}" \
         "${recipients[@]}"
 }
 
-# 检查依赖
-for command_name in df du numfmt msmtp awk logger; do
-    if ! command -v "$command_name" >/dev/null 2>&1; then
-        logger -t "$LOG_TAG" "Missing command: ${command_name}"
-        exit 1
-    fi
-done
-
-if [[ ! -d "$HOME_ROOT" ]]; then
-    logger -t "$LOG_TAG" "Home root does not exist: ${HOME_ROOT}"
-    exit 1
-fi
-
-# 遍历 /home 下一级目录
 find "$HOME_ROOT" \
     -mindepth 1 \
     -maxdepth 1 \
@@ -144,9 +241,6 @@ while IFS= read -r -d '' home_dir; do
     username="$(basename "$home_dir")"
     state_file="${STATE_DIR}/${username}.alerted"
 
-    # -x：不跨越到其他文件系统
-    # -s：只计算总大小
-    # --block-size=1：以字节输出
     usage_bytes="$(
         du -sx --block-size=1 "$home_dir" 2>/dev/null |
         awk '{print $1}'
@@ -162,11 +256,9 @@ while IFS= read -r -d '' home_dir; do
         numfmt --to=iec-i --suffix=B "$usage_bytes"
     )"
 
-    # 同时满足两个条件
     if (( usage_bytes > AVAILABLE_BYTES &&
           usage_bytes > MIN_USAGE_BYTES )); then
 
-        # 已提醒过则不重复发送
         if [[ -f "$state_file" ]]; then
             logger -t "$LOG_TAG" \
                 "Alert already active for user=${username}, usage=${usage_human}"
@@ -201,7 +293,6 @@ while IFS= read -r -d '' home_dir; do
                 "Failed to send alert: user=${username}, recipient=${recipient}"
         fi
     else
-        # 不再满足条件后清除状态，使其未来可以再次触发
         if [[ -f "$state_file" ]]; then
             rm -f "$state_file"
 
