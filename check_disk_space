@@ -20,6 +20,7 @@ RECIPIENT="xiaofan140@gmail.com"
 STATE_FILE="${HOME}/.disk_space_alert_sent"
 LOG_TAG="disk-monitor"
 MSMTP_BIN="msmtp"
+CONFIRM_BEFORE_SEND=true
 
 usage() {
     printf '%s\n' "$DESCRIPTION"
@@ -34,6 +35,8 @@ usage() {
         "  -s, --state-file PATH     告警状态文件，默认：${STATE_FILE}" \
         "      --log-tag TAG         syslog 日志标识，默认：${LOG_TAG}" \
         "      --msmtp-bin PATH      msmtp 命令路径，默认：${MSMTP_BIN}" \
+        "      --confirm             发送前要求用户确认，默认开启" \
+        "      --no-confirm          发送前不要求用户确认" \
         "  -h, --help                显示帮助"
 }
 
@@ -77,6 +80,14 @@ while (($# > 0)); do
             (($# >= 2)) || die "$1 需要一个参数"
             MSMTP_BIN="$2"
             shift 2
+            ;;
+        --confirm)
+            CONFIRM_BEFORE_SEND=true
+            shift
+            ;;
+        --no-confirm)
+            CONFIRM_BEFORE_SEND=false
+            shift
             ;;
         -h|--help)
             usage
@@ -138,15 +149,48 @@ send_alert() {
     } | "$MSMTP_BIN" "$RECIPIENT"
 }
 
+confirm_send() {
+    [[ "$CONFIRM_BEFORE_SEND" == true ]] || return 0
+
+    if [[ ! -r /dev/tty ]]; then
+        logger -t "$LOG_TAG" "Alert skipped: confirmation requested but no terminal is available"
+        return 1
+    fi
+
+    printf '%s\n' \
+        "即将发送磁盘空间告警：" \
+        "  发送对象 To: ${RECIPIENT}" \
+        "  主机: ${HOSTNAME_VALUE}" \
+        "  分区: ${MOUNT_POINT}" \
+        "  当前剩余空间: ${AVAILABLE_GB} GB" \
+        "  告警阈值: ${THRESHOLD_GB} GB" >/dev/tty
+    printf '确认发送？[y/N] ' >/dev/tty
+
+    local answer
+    IFS= read -r answer </dev/tty || return 1
+
+    case "$answer" in
+        y|Y|yes|YES)
+            return 0
+            ;;
+        *)
+            logger -t "$LOG_TAG" "Alert skipped by user confirmation"
+            return 1
+            ;;
+    esac
+}
+
 if (( AVAILABLE_BYTES < THRESHOLD_BYTES )); then
     if [[ ! -f "$STATE_FILE" ]]; then
-        if send_alert; then
-            touch "$STATE_FILE"
-            logger -t "$LOG_TAG" \
-                "Disk alert sent: ${MOUNT_POINT} has ${AVAILABLE_GB} GB available"
-        else
-            logger -t "$LOG_TAG" "Failed to send disk alert"
-            exit 1
+        if confirm_send; then
+            if send_alert; then
+                touch "$STATE_FILE"
+                logger -t "$LOG_TAG" \
+                    "Disk alert sent: ${MOUNT_POINT} has ${AVAILABLE_GB} GB available"
+            else
+                logger -t "$LOG_TAG" "Failed to send disk alert"
+                exit 1
+            fi
         fi
     fi
 else

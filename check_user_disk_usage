@@ -30,6 +30,7 @@ LOG_TAG="user-disk-monitor"
 SEND_ADMIN_COPY=true
 ADMIN_EMAIL="your_email@example.com"
 MSMTP_BIN="msmtp"
+CONFIRM_BEFORE_SEND=true
 
 usage() {
     printf '%s\n' "$DESCRIPTION"
@@ -49,6 +50,8 @@ usage() {
         "      --admin-copy             同时给管理员发送副本，默认开启" \
         "      --no-admin-copy          不给管理员发送副本" \
         "      --msmtp-bin PATH         msmtp 命令路径，默认：${MSMTP_BIN}" \
+        "      --confirm               发送前要求用户确认，默认开启" \
+        "      --no-confirm            发送前不要求用户确认" \
         "  -h, --help                   显示帮助"
 }
 
@@ -115,6 +118,14 @@ while (($# > 0)); do
             (($# >= 2)) || die "$1 需要一个参数"
             MSMTP_BIN="$2"
             shift 2
+            ;;
+        --confirm)
+            CONFIRM_BEFORE_SEND=true
+            shift
+            ;;
+        --no-confirm)
+            CONFIRM_BEFORE_SEND=false
+            shift
             ;;
         -h|--help)
             usage
@@ -232,6 +243,51 @@ send_alert() {
         "${recipients[@]}"
 }
 
+confirm_send() {
+    local username="$1"
+    local recipient="$2"
+    local usage_human="$3"
+    local home_dir="$4"
+
+    [[ "$CONFIRM_BEFORE_SEND" == true ]] || return 0
+
+    if [[ ! -r /dev/tty ]]; then
+        logger -t "$LOG_TAG" \
+            "Alert skipped for user=${username}: confirmation requested but no terminal is available"
+        return 1
+    fi
+
+    printf '%s\n' \
+        "即将发送用户磁盘告警：" \
+        "  发送对象 To: ${recipient}" >/dev/tty
+
+    if [[ "$SEND_ADMIN_COPY" == true ]] &&
+       [[ -n "$ADMIN_EMAIL" ]] &&
+       [[ "$ADMIN_EMAIL" != "$recipient" ]]; then
+        printf '  发送对象 Cc: %s\n' "$ADMIN_EMAIL" >/dev/tty
+    fi
+
+    printf '%s\n' \
+        "  主机: ${HOSTNAME_VALUE}" \
+        "  用户: ${username}" \
+        "  用户目录: ${home_dir}" \
+        "  用户占用空间: ${usage_human}" >/dev/tty
+    printf '确认发送？[y/N] ' >/dev/tty
+
+    local answer
+    IFS= read -r answer </dev/tty || return 1
+
+    case "$answer" in
+        y|Y|yes|YES)
+            return 0
+            ;;
+        *)
+            logger -t "$LOG_TAG" "Alert skipped by user confirmation: user=${username}"
+            return 1
+            ;;
+    esac
+}
+
 find "$HOME_ROOT" \
     -mindepth 1 \
     -maxdepth 1 \
@@ -273,24 +329,31 @@ while IFS= read -r -d '' home_dir; do
             continue
         fi
 
-        if send_alert \
+        if confirm_send \
             "$username" \
             "$recipient" \
-            "$usage_bytes" \
             "$usage_human" \
             "$home_dir"; then
 
-            {
-                echo "alert_time=${CURRENT_TIME}"
-                echo "usage_bytes=${usage_bytes}"
-                echo "available_bytes=${AVAILABLE_BYTES}"
-            } > "$state_file"
+            if send_alert \
+                "$username" \
+                "$recipient" \
+                "$usage_bytes" \
+                "$usage_human" \
+                "$home_dir"; then
 
-            logger -t "$LOG_TAG" \
-                "Alert sent to ${recipient}: user=${username}, usage=${usage_human}"
-        else
-            logger -t "$LOG_TAG" \
-                "Failed to send alert: user=${username}, recipient=${recipient}"
+                {
+                    echo "alert_time=${CURRENT_TIME}"
+                    echo "usage_bytes=${usage_bytes}"
+                    echo "available_bytes=${AVAILABLE_BYTES}"
+                } > "$state_file"
+
+                logger -t "$LOG_TAG" \
+                    "Alert sent to ${recipient}: user=${username}, usage=${usage_human}"
+            else
+                logger -t "$LOG_TAG" \
+                    "Failed to send alert: user=${username}, recipient=${recipient}"
+            fi
         fi
     else
         if [[ -f "$state_file" ]]; then
