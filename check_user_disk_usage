@@ -232,10 +232,15 @@ send_alert() {
         echo "最低告警阈值：${MIN_USAGE_GB} GB"
         echo "检测时间：${CURRENT_TIME}"
         echo
-        echo "请及时检查并清理不再需要的数据。"
+        echo "请您在方便时检查并清理不再需要的数据。"
+        echo "如果相关数据仍需保留，也可以考虑将数据、checkpoint 或环境放置在存储服务器上，以减轻系统盘压力。"
+        echo
+        echo "如果您没有特殊使用说明，无需回复此邮件；如果您发现本次检测逻辑可能有误，欢迎回复说明。"
         echo
         echo "常用检查命令："
         echo "du -xhd1 '${home_dir}' 2>/dev/null | sort -hr | head -n 20"
+        echo
+        echo "祝您工作顺利。"
         echo
         echo "此邮件由服务器磁盘监控程序自动发送。"
     } | "$MSMTP_BIN" \
