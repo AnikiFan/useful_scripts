@@ -12,6 +12,7 @@ check_user_disk_usage
 
 脚本通过状态目录记录已告警用户，避免重复发送。用户不再满足告警条件后，状态文件会被清除。
 用户名与邮箱映射文件格式为每行一个 username=email@example.com。
+用户目录名可以是 username，也可以带指定后缀（默认 username_data）；查找邮箱时会使用去除后缀后的用户名。
 
 示例：
   check_user_disk_usage --mount-point / --home-root /home --min-usage-gb 100 \
@@ -22,6 +23,7 @@ check_user_disk_usage
 
 MOUNT_POINT="/"
 HOME_ROOT="/home"
+USER_DIR_SUFFIX="_data"
 MIN_USAGE_GB=100
 EMAIL_MAP_FILE="/etc/disk-user-emails.conf"
 MSMTP_CONFIG="/root/.msmtprc"
@@ -42,6 +44,7 @@ usage() {
         "选项：" \
         "  -m, --mount-point PATH       用于判断可用空间的挂载点，默认：${MOUNT_POINT}" \
         "      --home-root PATH         用户目录根路径，默认：${HOME_ROOT}" \
+        "      --user-dir-suffix TEXT   用户目录名后缀，默认：${USER_DIR_SUFFIX}；传入空字符串可禁用" \
         "      --min-usage-gb GB        用户占用空间最低告警阈值，单位 GB，默认：${MIN_USAGE_GB}" \
         "      --email-map-file PATH    用户名与邮箱映射文件，默认：${EMAIL_MAP_FILE}" \
         "      --msmtp-config PATH      msmtp 配置文件，默认：${MSMTP_CONFIG}" \
@@ -76,6 +79,11 @@ while (($# > 0)); do
         --home-root)
             (($# >= 2)) || die "$1 需要一个参数"
             HOME_ROOT="$2"
+            shift 2
+            ;;
+        --user-dir-suffix)
+            (($# >= 2)) || die "$1 需要一个参数"
+            USER_DIR_SUFFIX="$2"
             shift 2
             ;;
         --min-usage-gb)
@@ -192,6 +200,18 @@ get_user_email() {
             exit
         }
     ' "$EMAIL_MAP_FILE"
+}
+
+get_username_from_directory() {
+    local directory_name="$1"
+
+    if [[ -n "$USER_DIR_SUFFIX" ]] &&
+       [[ "$directory_name" == *"$USER_DIR_SUFFIX" ]] &&
+       [[ "$directory_name" != "$USER_DIR_SUFFIX" ]]; then
+        printf '%s\n' "${directory_name%"$USER_DIR_SUFFIX"}"
+    else
+        printf '%s\n' "$directory_name"
+    fi
 }
 
 send_alert() {
@@ -315,8 +335,9 @@ find "$HOME_ROOT" \
     -type d \
     -print0 |
 while IFS= read -r -d '' home_dir; do
-    username="$(basename "$home_dir")"
-    state_file="${STATE_DIR}/${username}.alerted"
+    directory_name="$(basename "$home_dir")"
+    username="$(get_username_from_directory "$directory_name")"
+    state_file="${STATE_DIR}/${directory_name}.alerted"
 
     usage_bytes="$(
         du -sx --block-size=1 "$home_dir" 2>/dev/null |
