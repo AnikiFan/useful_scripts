@@ -1,0 +1,54 @@
+#!/bin/bash
+
+# 定义变量
+USERNAME=$1
+STORAGE_ROOT="/home/aiseon/storage"
+KEY_DIR="./keys/${USERNAME}_keys"  # 密钥保存目录
+
+# 检查是否提供了用户名
+if [ -z "$USERNAME" ]; then
+    echo "错误：请提供用户名作为参数。"
+    exit 1
+fi
+
+# 创建用户并设置密码
+sudo adduser $USERNAME
+
+# 在存储目录下创建用户专属文件夹
+# sudo mkdir -p $STORAGE_ROOT/${USERNAME}_data
+# sudo chown $USERNAME:$USERNAME $STORAGE_ROOT/${USERNAME}_data
+# sudo chmod 700 $STORAGE_ROOT/${USERNAME}_data
+
+# 给用户添加docker权限
+sudo usermod -aG docker $USERNAME
+echo "用户docker权限已经添加"
+
+# 在用户主目录下创建软链接
+# sudo ln -s $STORAGE_ROOT/${USERNAME}_data /home/$USERNAME/storage
+
+# 创建密钥保存目录
+mkdir -p $KEY_DIR
+
+# 生成 SSH 密钥对
+ssh-keygen -t rsa -b 4096 -C "$USERNAME@$(hostname)" -f $KEY_DIR/${USERNAME}_key -N ""
+
+# 设置密钥权限
+chmod 644 $KEY_DIR/${USERNAME}_key  # 私钥权限
+chmod 644 $KEY_DIR/${USERNAME}_key.pub  # 公钥权限
+
+# 将公钥写入用户的 authorized_keys 文件
+USER_HOME="/home/$USERNAME"
+sudo mkdir -p $USER_HOME/.ssh
+sudo chmod 700 $USER_HOME/.ssh
+sudo sh -c "cat $KEY_DIR/${USERNAME}_key.pub >> $USER_HOME/.ssh/authorized_keys"
+sudo chmod 600 $USER_HOME/.ssh/authorized_keys
+sudo chown -R $USERNAME:$USERNAME $USER_HOME/.ssh
+
+# 输出提示信息
+echo "用户 $USERNAME 已创建，存储文件夹软链接已设置。"
+echo "私钥已保存到：$KEY_DIR/$USERNAME"
+echo "公钥已写入用户的 authorized_keys 文件。"
+
+# 提示下载私钥
+echo "请下载私钥文件并分发给用户："
+echo "scp $(hostname):$(realpath $KEY_DIR/${USERNAME}_key) ./"
