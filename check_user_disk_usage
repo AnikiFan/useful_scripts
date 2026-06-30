@@ -10,7 +10,8 @@ check_user_disk_usage
 1. 用户目录占用空间大于系统盘当前可用空间
 2. 用户目录占用空间大于最低告警阈值
 
-脚本通过状态目录记录已告警用户，避免重复发送。用户不再满足告警条件后，状态文件会被清除。
+脚本通过状态目录记录已告警用户，在指定间隔内避免重复发送；默认每 30 天可再次提醒一次。
+用户不再满足告警条件后，状态文件会被清除；再次发送成功后，状态文件时间会被刷新。
 用户名与邮箱映射文件格式为每行一个 username=email@example.com。
 用户目录名可以是 username，也可以带指定后缀（默认 username_data）；查找邮箱时会使用去除后缀后的用户名。
 
@@ -25,6 +26,7 @@ MOUNT_POINT="/"
 HOME_ROOT="/home"
 USER_DIR_SUFFIX="_data"
 MIN_USAGE_GB=100
+ALERT_INTERVAL_DAYS=30
 EMAIL_MAP_FILE="/etc/disk-user-emails.conf"
 MSMTP_CONFIG="/root/.msmtprc"
 STATE_DIR="/var/lib/user-disk-alert"
@@ -46,6 +48,7 @@ usage() {
         "      --home-root PATH         用户目录根路径，默认：${HOME_ROOT}" \
         "      --user-dir-suffix TEXT   用户目录名后缀，默认：${USER_DIR_SUFFIX}；传入空字符串可禁用" \
         "      --min-usage-gb GB        用户占用空间最低告警阈值，单位 GB，默认：${MIN_USAGE_GB}" \
+        "      --alert-interval-days DAYS  同一目录重复告警的间隔天数，默认：${ALERT_INTERVAL_DAYS}" \
         "      --email-map-file PATH    用户名与邮箱映射文件，默认：${EMAIL_MAP_FILE}" \
         "      --msmtp-config PATH      msmtp 配置文件，默认：${MSMTP_CONFIG}" \
         "      --state-dir PATH         告警状态目录，默认：${STATE_DIR}" \
@@ -89,6 +92,11 @@ while (($# > 0)); do
         --min-usage-gb)
             (($# >= 2)) || die "$1 需要一个参数"
             MIN_USAGE_GB="$2"
+            shift 2
+            ;;
+        --alert-interval-days)
+            (($# >= 2)) || die "$1 需要一个参数"
+            ALERT_INTERVAL_DAYS="$2"
             shift 2
             ;;
         --email-map-file)
@@ -153,10 +161,11 @@ while (($# > 0)); do
 done
 
 is_positive_integer "$MIN_USAGE_GB" || die "--min-usage-gb 必须是正整数"
+is_positive_integer "$ALERT_INTERVAL_DAYS" || die "--alert-interval-days 必须是正整数"
 [[ -d "$MOUNT_POINT" ]] || die "挂载点不存在：${MOUNT_POINT}"
 [[ -d "$HOME_ROOT" ]] || die "用户目录根路径不存在：${HOME_ROOT}"
 
-for command_name in df du numfmt awk logger find basename tail tr hostname date mkdir; do
+for command_name in df du numfmt awk logger find basename tail tr hostname date mkdir stat; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         die "缺少命令：${command_name}"
     fi
@@ -187,6 +196,7 @@ if [[ ! "$AVAILABLE_BYTES" =~ ^[0-9]+$ ]]; then
 fi
 
 MIN_USAGE_BYTES=$((MIN_USAGE_GB * 1024 * 1024 * 1024))
+ALERT_INTERVAL_SECONDS=$((ALERT_INTERVAL_DAYS * 24 * 60 * 60))
 AVAILABLE_GB=$((AVAILABLE_BYTES / 1024 / 1024 / 1024))
 
 get_user_email() {
@@ -358,9 +368,24 @@ while IFS= read -r -d '' home_dir; do
           usage_bytes > MIN_USAGE_BYTES )); then
 
         if [[ -f "$state_file" ]]; then
+            current_epoch="$(date '+%s')"
+            state_modified_epoch="$(stat -c '%Y' "$state_file" 2>/dev/null || true)"
+
+            if [[ ! "$state_modified_epoch" =~ ^[0-9]+$ ]]; then
+                logger -t "$LOG_TAG" \
+                    "Unable to read alert state time for user=${username}, state_file=${state_file}"
+                continue
+            fi
+
+            if (( state_modified_epoch > current_epoch ||
+                  current_epoch - state_modified_epoch < ALERT_INTERVAL_SECONDS )); then
+                logger -t "$LOG_TAG" \
+                    "Alert interval not reached for user=${username}, usage=${usage_human}, state_file=${state_file}"
+                continue
+            fi
+
             logger -t "$LOG_TAG" \
-                "Alert already active for user=${username}, usage=${usage_human}"
-            continue
+                "Alert interval reached for user=${username}, usage=${usage_human}, state_file=${state_file}"
         fi
 
         recipient="$(get_user_email "$username" || true)"
