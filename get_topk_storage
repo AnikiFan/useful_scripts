@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+
+# 用法:
+#   ./top_dirs.sh <目录> <K>
+
+if [ "$#" -ne 2 ]; then
+    echo "Usage: $0 <directory> <K>"
+    exit 1
+fi
+
+TARGET_DIR="$1"
+K="$2"
+
+if [ ! -d "$TARGET_DIR" ]; then
+    echo "Error: directory does not exist: $TARGET_DIR"
+    exit 1
+fi
+
+if ! [[ "$K" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: K must be a positive integer."
+    exit 1
+fi
+
+printf "%-12s %s\n" "SIZE (GB)" "DIRECTORY"
+printf "%-12s %s\n" "------------" "---------"
+
+du -sk "$TARGET_DIR"/*/ 2>/dev/null \
+    | sort -nr \
+    | head -n "$K" \
+    | awk -v base="$TARGET_DIR/" '{
+        size_gb = $1 / 1024 / 1024;
+
+        $1 = "";
+        sub(/^[ \t]+/, "", $0);
+
+        # 去掉目标目录前缀和最后的 /
+        name = $0;
+        sub("^" base, "", name);
+        sub("/$", "", name);
+
+        printf "%-12.2f %s\n", size_gb, name;
+    }'
