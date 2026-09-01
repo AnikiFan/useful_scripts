@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 
 # 用法:
-#   ./top_dirs.sh <目录> <K>
+#   ./get_topk_storage <目录> <K>
+#
+# 使用 gdu 非交互模式扫描目录，列出占用空间最大的 K 个子目录。
 
 if [ "$#" -ne 2 ]; then
     echo "Usage: $0 <directory> <K>"
@@ -21,22 +23,67 @@ if ! [[ "$K" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
+if ! command -v gdu >/dev/null 2>&1; then
+    echo "Error: gdu is required but not found in PATH."
+    exit 1
+fi
+
 printf "%-12s %s\n" "SIZE (GB)" "DIRECTORY"
 printf "%-12s %s\n" "------------" "---------"
 
-du -sk "$TARGET_DIR"/*/ 2>/dev/null \
-    | sort -nr \
-    | head -n "$K" \
-    | awk -v base="$TARGET_DIR/" '{
-        size_gb = $1 / 1024 / 1024;
+# -n 非交互, -p 不显示进度, -c 关闭颜色，便于解析。
+# gdu 会按占用从大到小列出当前目录的直接子项。
+gdu -npc "$TARGET_DIR" 2>/dev/null \
+    | awk -v k="$K" '
+        function size_to_gb(num, unit) {
+            if (unit == "B")   return num / 1024 / 1024 / 1024
+            if (unit == "KiB") return num / 1024 / 1024
+            if (unit == "MiB") return num / 1024
+            if (unit == "GiB") return num
+            if (unit == "TiB") return num * 1024
+            if (unit == "PiB") return num * 1024 * 1024
+            if (unit == "EiB") return num * 1024 * 1024 * 1024
+            if (unit == "kB")  return num * 1000 / 1024 / 1024 / 1024
+            if (unit == "MB")  return num * 1000 * 1000 / 1024 / 1024 / 1024
+            if (unit == "GB")  return num * 1000 * 1000 * 1000 / 1024 / 1024 / 1024
+            if (unit == "TB")  return num * 1000 * 1000 * 1000 * 1000 / 1024 / 1024 / 1024
+            if (unit == "PB")  return num * 1000 * 1000 * 1000 * 1000 * 1000 / 1024 / 1024 / 1024
+            if (unit == "EB")  return num * 1000 * 1000 * 1000 * 1000 * 1000 * 1000 / 1024 / 1024 / 1024
+            return -1
+        }
 
-        $1 = "";
-        sub(/^[ \t]+/, "", $0);
+        {
+            idx = 1
+            # gdu 行首可能带单字符标记，例如 e 表示扫描出错
+            if ($1 ~ /^[^0-9.-]$/) {
+                idx = 2
+            }
 
-        # 去掉目标目录前缀和最后的 /
-        name = $0;
-        sub("^" base, "", name);
-        sub("/$", "", name);
+            num = $idx
+            unit = $(idx + 1)
+            name = $(idx + 2)
+            for (i = idx + 3; i <= NF; i++) {
+                name = name " " $i
+            }
 
-        printf "%-12.2f %s\n", size_gb, name;
-    }'
+            # 只保留子目录（gdu 给目录名加上了前导 /）
+            if (name !~ /^\//) {
+                next
+            }
+            if (num !~ /^[0-9]+(\.[0-9]+)?$/) {
+                next
+            }
+
+            gb = size_to_gb(num + 0, unit)
+            if (gb < 0) {
+                next
+            }
+
+            sub(/^\//, "", name)
+            printf "%-12.2f %s\n", gb, name
+
+            if (++shown >= k) {
+                exit
+            }
+        }
+    '

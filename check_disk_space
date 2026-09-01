@@ -9,6 +9,8 @@ check_disk_space
 监控指定挂载点的剩余空间。当可用空间低于阈值时发送邮件告警，并使用状态文件避免重复发送。
 当空间恢复到阈值以上后，状态文件会被清除，之后再次低于阈值时会重新告警。
 
+磁盘信息通过 gdu --show-disks 获取，不再使用 df。
+
 示例：
   check_disk_space --mount-point / --threshold-gb 50 --recipient admin@example.com
   check_disk_space -m /data -t 200 -r ops@example.com --state-file /var/lib/disk-alert/data.alerted
@@ -47,6 +49,105 @@ die() {
 
 is_positive_integer() {
     [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]
+}
+
+normalize_path() {
+    local path="$1"
+
+    if [[ "$path" != "/" ]]; then
+        path="${path%/}"
+    fi
+
+    if [[ -d "$path" ]]; then
+        path="$(cd "$path" && pwd)"
+    fi
+
+    printf '%s\n' "$path"
+}
+
+# 从 gdu --show-disks 文本中解析 target 所在文件系统的可用字节
+parse_available_bytes_from_gdu_table() {
+    local target="$1"
+    local gdu_output="$2"
+
+    awk -v target="$target" '
+        function path_matches(mount, path) {
+            if (mount == "/") {
+                return 1
+            }
+            if (path == mount) {
+                return 1
+            }
+            if (substr(path, 1, length(mount) + 1) == mount "/") {
+                return 1
+            }
+            return 0
+        }
+
+        function to_bytes(num, unit,   m) {
+            m = 0
+            if (unit == "B") m = 1
+            else if (unit == "KiB") m = 1024
+            else if (unit == "MiB") m = 1024 ^ 2
+            else if (unit == "GiB") m = 1024 ^ 3
+            else if (unit == "TiB") m = 1024 ^ 4
+            else if (unit == "PiB") m = 1024 ^ 5
+            else if (unit == "EiB") m = 1024 ^ 6
+            else if (unit == "kB") m = 1000
+            else if (unit == "MB") m = 1000 ^ 2
+            else if (unit == "GB") m = 1000 ^ 3
+            else if (unit == "TB") m = 1000 ^ 4
+            else if (unit == "PB") m = 1000 ^ 5
+            else if (unit == "EB") m = 1000 ^ 6
+            else return -1
+            return num * m
+        }
+
+        BEGIN {
+            best_len = -1
+        }
+
+        $1 == "Device" {
+            next
+        }
+
+        NF < 9 {
+            next
+        }
+
+        {
+            mount = $9
+            for (i = 10; i <= NF; i++) {
+                mount = mount " " $i
+            }
+
+            if (!path_matches(mount, target)) {
+                next
+            }
+
+            if ($6 !~ /^[0-9]+(\.[0-9]+)?$/) {
+                next
+            }
+
+            free_bytes = to_bytes($6 + 0, $7)
+            if (free_bytes < 0) {
+                next
+            }
+
+            len = length(mount)
+            if (len > best_len) {
+                best_len = len
+                best_free = free_bytes
+            }
+        }
+
+        END {
+            if (best_len < 0) {
+                exit 1
+            }
+            printf "%.0f\n", best_free
+        }
+    ' <<< "$gdu_output"
 }
 
 while (($# > 0)); do
@@ -103,7 +204,7 @@ is_positive_integer "$THRESHOLD_GB" || die "--threshold-gb 必须是正整数"
 [[ -n "$RECIPIENT" ]] || die "--recipient 不能为空"
 [[ -d "$MOUNT_POINT" ]] || die "挂载点不存在：${MOUNT_POINT}"
 
-for command_name in df tail tr hostname date logger dirname mkdir; do
+for command_name in gdu awk hostname date logger dirname mkdir; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         die "缺少命令：${command_name}"
     fi
@@ -118,8 +219,17 @@ mkdir -p "$STATE_PARENT"
 
 HOSTNAME_VALUE="$(hostname)"
 CURRENT_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
+MOUNT_POINT="$(normalize_path "$MOUNT_POINT")"
 
-AVAILABLE_BYTES="$(df -B1 --output=avail "$MOUNT_POINT" | tail -n 1 | tr -d '[:space:]')"
+GDU_DISK_TABLE="$(gdu -ndpc 2>/dev/null)" || {
+    logger -t "$LOG_TAG" "Unable to get available disk space for ${MOUNT_POINT}"
+    die "无法通过 gdu 获取磁盘列表"
+}
+
+AVAILABLE_BYTES="$(parse_available_bytes_from_gdu_table "$MOUNT_POINT" "$GDU_DISK_TABLE")" || {
+    logger -t "$LOG_TAG" "Unable to get available disk space for ${MOUNT_POINT}"
+    die "无法通过 gdu 获取 ${MOUNT_POINT} 的可用空间"
+}
 
 if [[ ! "$AVAILABLE_BYTES" =~ ^[0-9]+$ ]]; then
     logger -t "$LOG_TAG" "Unable to get available disk space for ${MOUNT_POINT}"
@@ -144,8 +254,8 @@ send_alert() {
         echo "告警阈值：${THRESHOLD_GB} GB"
         echo "检测时间：${CURRENT_TIME}"
         echo
-        echo "磁盘使用情况："
-        df -h "$MOUNT_POINT"
+        echo "磁盘使用情况（gdu --show-disks）："
+        printf '%s\n' "$GDU_DISK_TABLE"
     } | "$MSMTP_BIN" "$RECIPIENT"
 }
 
