@@ -203,6 +203,7 @@ get_available_bytes_from_gdu() {
             if (len > best_len) {
                 best_len = len
                 best_free = free_bytes
+                best_free_text = $6 " " $7
             }
         }
 
@@ -210,7 +211,7 @@ get_available_bytes_from_gdu() {
             if (best_len < 0) {
                 exit 1
             }
-            printf "%.0f\n", best_free
+            printf "%.0f\t%s\n", best_free, best_free_text
         }
     ' <<< "$gdu_output"
 }
@@ -355,19 +356,20 @@ HOSTNAME_VALUE="$(hostname -f 2>/dev/null || hostname)"
 CURRENT_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 MOUNT_POINT="$(normalize_path "$MOUNT_POINT")"
 
-AVAILABLE_BYTES="$(get_available_bytes_from_gdu "$MOUNT_POINT")" || {
+AVAILABLE_INFO="$(get_available_bytes_from_gdu "$MOUNT_POINT")" || {
     logger -t "$LOG_TAG" "Unable to get available disk space"
     die "无法通过 gdu 获取 ${MOUNT_POINT} 的可用空间"
 }
+AVAILABLE_BYTES="${AVAILABLE_INFO%%$'\t'*}"
+AVAILABLE_HUMAN="${AVAILABLE_INFO#*$'\t'}"
 
-if [[ ! "$AVAILABLE_BYTES" =~ ^[0-9]+$ ]]; then
+if [[ ! "$AVAILABLE_BYTES" =~ ^[0-9]+$ || -z "$AVAILABLE_HUMAN" ]]; then
     logger -t "$LOG_TAG" "Unable to get available disk space"
     exit 1
 fi
 
 MIN_USAGE_BYTES=$((MIN_USAGE_GB * 1024 * 1024 * 1024))
 ALERT_INTERVAL_SECONDS=$((ALERT_INTERVAL_DAYS * 24 * 60 * 60))
-AVAILABLE_GB=$((AVAILABLE_BYTES / 1024 / 1024 / 1024))
 
 get_user_email() {
     local username="$1"
@@ -444,7 +446,7 @@ send_alert() {
         echo "用户目录：${home_dir}"
         echo "您的占用空间：${usage_human}"
         echo "您的占用字节数：${usage_bytes}"
-        echo "系统盘当前可用空间：${AVAILABLE_GB} GB"
+        echo "系统盘当前可用空间：${AVAILABLE_HUMAN}"
         echo "最低告警阈值：${MIN_USAGE_GB} GB"
         echo "检测时间：${CURRENT_TIME}"
         echo
