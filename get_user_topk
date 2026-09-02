@@ -443,6 +443,7 @@ print_topk_dirs() {
 
     if [[ -z "$table" ]]; then
         printf '  %s📭 没有找到子文件夹。%s\n' "$C_DIM" "$C_RESET"
+        printf '%s────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
         return
     fi
 
