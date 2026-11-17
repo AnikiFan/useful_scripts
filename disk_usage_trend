@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Collect existing Top-K reports and plot their observed history in a terminal."""
+from __future__ import annotations
+
+import argparse
+from contextlib import closing
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import sqlite3
+import stat
+import sys
+import textwrap
+import unicodedata
+
+UTC = timezone.utc
+DEFAULT_CONFIG = Path('/etc/disk-usage-trend.json')
+ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+ROW = re.compile(r'^\s*(?:[🥇🥈🥉]|\d+\.)\s+(\d+(?:\.\d+)?)\s+(B|[KMGTPE]iB|[kMGTPE]B)\s+(.+?)\s*$')
+UNITS = {'B': 1, **{f'{p}iB': 1024**i for i, p in enumerate('KMGTPE', 1)},
+         **{f'{p}B': 1000**i for i, p in enumerate('kMGTPE', 1)}}
+SCHEMA = '''
+CREATE TABLE IF NOT EXISTS snapshots (
+    id INTEGER PRIMARY KEY, source TEXT NOT NULL, timestamp_ns INTEGER NOT NULL,
+    digest TEXT NOT NULL, UNIQUE(source, timestamp_ns));
+CREATE TABLE IF NOT EXISTS usages (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    name TEXT NOT NULL, bytes INTEGER NOT NULL CHECK(bytes >= 0),
+    rank INTEGER NOT NULL, PRIMARY KEY(snapshot_id, name));
+CREATE INDEX IF NOT EXISTS snapshot_time ON snapshots(source, timestamp_ns);
+'''
+
+
+@dataclass(frozen=True)
+class Observation:
+    """One original cached report, timestamped by its last modification time."""
+    timestamp_ns: int
+    digest: str
+    rows: tuple
+
+
+def safe_text(value):
+    """Render untrusted directory names without terminal control characters."""
+    return ''.join('?' if unicodedata.category(c).startswith('C') else c for c in str(value))
+
+
+def parse_report(text):
+    """Parse existing get_user_topk output without scanning any directory."""
+    text = ANSI.sub('', text)
+    heading = re.search(r'占用空间\s+Top\s+(\d+)', text)
+    if not heading:
+        raise ValueError('没有完整的 Top K 标题')
+    rows = []
+    seen = set()
+    for line in text.splitlines():
+        match = ROW.match(line)
+        if match is None:
+            continue
+        number, unit, name = match.groups()
+        size = int(Decimal(number) * UNITS[unit])
+        if size > 2**63 - 1 or name in seen:
+            raise ValueError('报告含重复目录或超出范围的用量')
+        seen.add(name)
+        rows.append((name, size))
+    if not rows:
+        raise ValueError('报告没有可用的目录用量；可能正在更新')
+    if len(rows) != int(heading.group(1)):
+        raise ValueError('报告行数与 Top K 标题不符，未记录不完整快照')
+    return tuple(rows)
+
+
+def read_observation(path, *, now=None, minimum_age=60):
+    """Reject incomplete, oversized, or currently changing cache files."""
+    now = now or datetime.now(UTC)
+    # Cache directories can be user-writable: never follow a final symlink or
+    # block on a FIFO when the collector runs as root.
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, 'rb') as handle:
+        before = os.fstat(handle.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 1024 * 1024:
+            raise ValueError('报告必须为不超过 1 MiB 的普通文件')
+        age = now.timestamp() - before.st_mtime
+        if age < minimum_age:
+            raise ValueError('报告刚更新或时间在未来，等待下一轮采集')
+        raw = handle.read(1024 * 1024 + 1)
+        after = os.fstat(handle.fileno())
+    if (before.st_ino, before.st_mtime_ns, before.st_size) != (after.st_ino, after.st_mtime_ns, after.st_size):
+        raise ValueError('报告正在更新')
+    if not raw.endswith(b'\n'):
+        raise ValueError('报告尚未写完')
+    return Observation(after.st_mtime_ns, hashlib.sha256(raw).hexdigest(),
+                       parse_report(raw.decode('utf-8')))
+
+
+def load_config(path):
+    """Read a small administrator-controlled JSON configuration."""
+    config = json.loads(path.read_text())
+    if not isinstance(config.get('sources'), list) or not config['sources']:
+        raise ValueError('sources 必须为非空列表')
+    ids = [s['id'] for s in config['sources']]
+    if len(set(ids)) != len(ids) or any(not re.fullmatch(r'[a-z][a-z0-9_-]*', s) for s in ids):
+        raise ValueError('数据源 id 必须唯一且仅含小写字母、数字、下划线或短横线')
+    if not Path(config['database']).is_absolute():
+        raise ValueError('database 必须为绝对路径')
+    if not 1 <= int(config.get('default_days', 14)) <= 3650:
+        raise ValueError('default_days 必须为 1–3650')
+    if not 14 <= int(config.get('retention_days', 365)) <= 3650:
+        raise ValueError('retention_days 必须为 14–3650')
+    if any(not Path(source['report']).is_absolute() for source in config['sources']):
+        raise ValueError('report 必须为绝对路径')
+    return config
+
+
+def store_observation(connection, source, observation):
+    """Store a new cache version once; polling never creates fake samples."""
+    old = connection.execute('SELECT id, digest FROM snapshots WHERE source=? AND timestamp_ns=?',
+                             (source, observation.timestamp_ns)).fetchone()
+    if old:
+        if old[1] != observation.digest:
+            raise ValueError('相同时间戳出现不同报告，未覆盖历史')
+        return False
+    cursor = connection.execute('INSERT INTO snapshots(source,timestamp_ns,digest) VALUES (?,?,?)',
+                                (source, observation.timestamp_ns, observation.digest))
+    connection.executemany('INSERT INTO usages(snapshot_id,name,bytes,rank) VALUES (?,?,?,?)',
+                           [(cursor.lastrowid, name, size, rank)
+                            for rank, (name, size) in enumerate(observation.rows, 1)])
+    return True
+
+
+def collect(config, *, now=None):
+    """Collect tiny cached reports transactionally, never running gdu or du."""
+    now = now or datetime.now(UTC)
+    path = Path(config['database'])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    outcomes = []
+    with closing(sqlite3.connect(str(path), timeout=5)) as connection:
+        connection.execute('PRAGMA foreign_keys=ON')
+        connection.executescript(SCHEMA)
+        for source in config['sources']:
+            try:
+                observation = read_observation(Path(source['report']), now=now)
+                with connection:
+                    added = store_observation(connection, source['id'], observation)
+                outcomes.append((source['id'], '新增观测' if added else '缓存未变'))
+            except (OSError, ValueError, UnicodeError) as error:
+                outcomes.append((source['id'], f'跳过：{safe_text(error)}'))
+        retention = int(config.get('retention_days', 365))
+        if retention < 14:
+            raise ValueError('retention_days 不得小于 14')
+        cutoff = int((now - timedelta(days=retention)).timestamp() * 10**9)
+        with connection:
+            connection.execute('DELETE FROM snapshots WHERE timestamp_ns < ?', (cutoff,))
+    path.chmod(0o644)
+    return outcomes
+
+
+def parse_date(value, *, end=False):
+    """Interpret ISO dates in local time; an end date includes that whole day."""
+    parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if end and len(value) == 10:
+        parsed += timedelta(days=1)
+    return parsed.astimezone(UTC)
+
+
+def get_window(days=None, since=None, until=None, *, default_days=14, now=None):
+    """Return an aware half-open time window [start, end)."""
+    end = parse_date(until, end=True) if until else (now or datetime.now(UTC))
+    count = default_days if days is None else days
+    if not 1 <= count <= 3650:
+        raise ValueError('天数必须为 1–3650')
+    start = parse_date(since) if since else end - timedelta(days=count)
+    if start >= end:
+        raise ValueError('开始时间必须早于结束时间')
+    return start, end
+
+
+def load_series(connection, source_id, start, end, *, top=5):
+    """Follow the latest Top K identities, retaining gaps when ranks change."""
+    snapshots = connection.execute(
+        'SELECT id,timestamp_ns FROM snapshots WHERE source=? AND timestamp_ns>=? '
+        'AND timestamp_ns<? ORDER BY timestamp_ns',
+        (source_id, int(start.timestamp()*10**9), int(end.timestamp()*10**9))).fetchall()
+    if not snapshots:
+        return [], [], []
+    names = connection.execute('SELECT name,bytes FROM usages WHERE snapshot_id=? ORDER BY rank LIMIT ?',
+                               (snapshots[-1][0], top)).fetchall()
+    points = {name: [] for name, _ in names}
+    for snapshot_id, timestamp in snapshots:
+        values = dict(connection.execute('SELECT name,bytes FROM usages WHERE snapshot_id=?', (snapshot_id,)))
+        for name in points:
+            points[name].append(values.get(name))
+    return [datetime.fromtimestamp(ts/10**9, UTC) for _, ts in snapshots], names, [points[name] for name, _ in names]
+
+
+def human_bytes(value):
+    """Format byte counts in binary units."""
+    unit = 'B'
+    amount = float(value)
+    for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB']:
+        if amount < 1024 or unit == 'EiB':
+            break
+        amount /= 1024
+    return f'{amount:g} {unit}' if amount.is_integer() else f'{amount:.1f} {unit}'
+
+
+def logarithmic_row(value, low, high, height):
+    """Map positive bytes to a base-2 logarithmic vertical coordinate."""
+    if value <= 0:
+        raise ValueError('对数轴仅接受正值')
+    return round((high - math.log2(value)) / (high - low) * (height - 1))
+
+
+def segment(x0, y0, x1, y1):
+    """Yield integer pixels of a connected line using Bresenham's algorithm."""
+    dx, dy = abs(x1-x0), -abs(y1-y0)
+    sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+    error = dx + dy
+    while True:
+        yield x0, y0
+        if x0 == x1 and y0 == y1:
+            break
+        twice = 2*error
+        if twice >= dy:
+            error += dy
+            x0 += sx
+        if twice <= dx:
+            error += dx
+            y0 += sy
+
+
+def render_chart(source, times, names, series, start, end, *, width=80, height=9, color=False):
+    """Draw five labeled trajectories; missing/zero values never become fake lines."""
+    label = safe_text(source.get('label', source['id']))
+    title = f"磁盘趋势 · {label} · {start.astimezone():%Y-%m-%d} — {end.astimezone():%Y-%m-%d} · log₂"
+    if not times:
+        return title + '\n  此时间段尚无历史观测。\n'
+    positive = [value for values in series for value in values if value is not None and value > 0]
+    latest = times[-1].astimezone().strftime('%m-%d %H:%M')
+    info = f'  最新观测 {latest}；{len(times)} 个快照；图例为该时刻 Top {len(names)}。'
+    if not positive:
+        return title + '\n' + info + '\n  用量均为 0 B；对数轴无法显示零值。\n'
+    low, high = math.floor(math.log2(min(positive))), math.ceil(math.log2(max(positive)))
+    if low == high:
+        low, high = max(0, low-1), high+1
+    columns = max(24, width-13)
+    cells = [[set() for _ in range(columns)] for _ in range(height)]
+    duration = (end-start).total_seconds()
+    for index, values in enumerate(series, 1):
+        previous = None
+        for timestamp, value in zip(times, values):
+            if value is None or value <= 0:
+                previous = None
+                continue
+            x = min(columns-1, max(0, round((timestamp-start).total_seconds()/duration*(columns-1))))
+            y = logarithmic_row(value, low, high, height)
+            if previous is not None and (timestamp-previous[2]).total_seconds() <= 48*3600:
+                pixels = segment(previous[0], previous[1], x, y)
+            else:
+                pixels = [(x,y)]
+            for column, row in pixels:
+                cells[row][column].add(index)
+            previous = (x,y,timestamp)
+    ticks = {}
+    stride = max(1, math.ceil((high-low)/(height-1)))
+    for exponent in sorted(set(range(low,high+1,stride)) | {low,high}):
+        ticks[logarithmic_row(2**exponent,low,high,height)] = human_bytes(2**exponent)
+    palette = [36, 33, 35, 32, 34]
+    lines = [title, info]
+    for row in range(height):
+        chars = []
+        for ids in cells[row]:
+            character = '*' if len(ids)>1 else str(next(iter(ids))) if ids else ' '
+            if color and len(ids)==1:
+                character = f'\033[{palette[(next(iter(ids))-1)%5]}m{character}\033[0m'
+            chars.append(character)
+        lines.append(f'{ticks.get(row, ""):>10} │'+''.join(chars))
+    lines.append('           └'+'─'*columns)
+    axis = [' ']*columns
+    for fraction in [0,0.5,1]:
+        stamp = (start+(end-start)*fraction).astimezone().strftime('%m-%d')
+        offset = max(0,min(columns-len(stamp),round(fraction*(columns-1))-len(stamp)//2))
+        axis[offset:offset+len(stamp)] = stamp
+    lines.append('            '+''.join(axis))
+    legend = ' · '.join(f'{i} {safe_text(name)} {human_bytes(size)}' for i,(name,size) in enumerate(names,1))
+    lines.extend(textwrap.wrap(legend,width=max(40,width),initial_indent='  ',subsequent_indent='  '))
+    lines.append('  数字标识各条曲线，* 为重叠；缺测/不在当时榜单/0 B 处留空。')
+    if len(times)==1:
+        lines.append('  目前只有一个真实快照，尚不能形成变化曲线；后续自动累积。')
+    return '\n'.join(lines)+'\n'
+
+
+def show(config, *, start, end, source_id=None, width=80, height=9, color=False):
+    """Read local history only; login never reads or scans network storage."""
+    sources = [s for s in config['sources'] if source_id is None or s['id']==source_id]
+    if not sources:
+        raise ValueError('未知数据源')
+    path = Path(config['database'])
+    with closing(sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=1)) as connection:
+        return '\n'.join(render_chart(source,*load_series(connection,source['id'],start,end),
+                                      start,end,width=width,height=height,color=color) for source in sources)
+
+
+def main(argv=None):
+    """Run collection or user-selectable history rendering."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command',choices=['collect','show'])
+    parser.add_argument('--config',type=Path,default=DEFAULT_CONFIG)
+    parser.add_argument('--quiet',action='store_true',help='失败时静默退出，供登录提示使用')
+    parser.add_argument('--source',help='仅显示 home / storage / storage2')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--days',type=int,help='过去多少天，默认14')
+    group.add_argument('--since',help='起始日期或ISO时间')
+    parser.add_argument('--until',help='结束日期或ISO时间；日期包含当日')
+    parser.add_argument('--width',type=int,default=min(120,shutil.get_terminal_size((80,24)).columns))
+    parser.add_argument('--height',type=int,default=9)
+    parser.add_argument('--color',choices=['auto','always','never'],default='auto')
+    args = parser.parse_args(argv)
+    try:
+        config = load_config(args.config)
+        if args.command=='collect':
+            for source,result in collect(config):
+                if not args.quiet:
+                    print(f'{source}: {result}')
+        else:
+            if not 40<=args.width<=200 or not 5<=args.height<=30:
+                raise ValueError('width须为40–200，height须为5–30')
+            start,end = get_window(args.days,args.since,args.until,default_days=int(config.get('default_days',14)))
+            color = args.color=='always' or (args.color=='auto' and sys.stdout.isatty() and 'NO_COLOR' not in os.environ)
+            print(show(config,start=start,end=end,source_id=args.source,width=args.width,height=args.height,color=color),end='')
+        return 0
+    except (OSError,ValueError,KeyError,TypeError,sqlite3.Error) as error:
+        if not args.quiet:
+            print(f'disk_usage_trend: {safe_text(error)}',file=sys.stderr)
+        return 1
+
+
+if __name__=='__main__':
+    sys.exit(main())
