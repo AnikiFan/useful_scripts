@@ -30,13 +30,13 @@ exec /usr/bin/python3 -I /usr/local/libexec/disk-usage-trend.py "$@"
 '''
 MOTD = '''#!/bin/sh
 # Only reads the local SQLite history. Never scans disks during login.
-if grep -Eq '^# disk-usage-trend: (interleaved-v1|compact-v2)$' /etc/update-motd.d/99-custom-message 2>/dev/null; then
+if grep -Eq '^# disk-usage-trend: (interleaved-v1|compact-v2|compact-v3)$' /etc/update-motd.d/99-custom-message 2>/dev/null; then
     exit 0
 fi
 /usr/local/bin/disk_usage_trend show --width 80 --height 15 --color always --quiet || :
 '''
 SERVICE = '''[Unit]
-Description=Record existing disk Top 5 cache snapshots
+Description=Record existing disk Top K cache snapshots
 
 [Service]
 Type=oneshot
@@ -54,7 +54,7 @@ ReadWritePaths=/var/lib/disk-usage-trend
 RestrictAddressFamilies=AF_UNIX
 '''
 TIMER = '''[Unit]
-Description=Collect disk Top 5 history every hour
+Description=Collect disk Top K history every hour
 
 [Timer]
 OnCalendar=hourly
@@ -70,12 +70,20 @@ WantedBy=timers.target
 
 def interleave_hook(text, sources):
     """Replace static reports with capacity summaries and graphs, preserving banners."""
-    marker = '# disk-usage-trend: compact-v2'
+    marker = '# disk-usage-trend: compact-v3'
     if marker in text.splitlines():
+        for source in sources:
+            if text.count(chart_command(source['id'])) != 1 or summary_command(source['id']) in text:
+                raise ValueError('Managed MOTD layout was edited; inspect before updating')
+        return text
+    previous = '# disk-usage-trend: compact-v2'
+    if previous in text.splitlines():
         for source in sources:
             if text.count(chart_command(source['id'])) != 1 or text.count(summary_command(source['id'])) != 1:
                 raise ValueError('Managed MOTD layout was edited; inspect before updating')
-        return text
+        summaries = {summary_command(source['id']) for source in sources}
+        return ''.join(line for line in text.replace(previous, marker).splitlines(keepends=True)
+                       if line.rstrip('\n') not in summaries)
     legacy_marker = '# disk-usage-trend: interleaved-v1'
     if legacy_marker in text.splitlines():
         legacy_commands = [chart_command(source['id']).replace('--height 15', '--height 9') for source in sources]
@@ -102,7 +110,6 @@ def interleave_hook(text, sources):
     output = []
     for index, line in enumerate(lines):
         if index in matches:
-            output.append(summary_command(matches[index]) + '\n')
             output.append(chart_command(matches[index]) + '\n')
         else:
             output.append(line)
@@ -182,7 +189,7 @@ def install(root, *, activate=False):
         subprocess.run(['systemctl', 'start', 'disk-usage-trend.service'], check=True)
         subprocess.run(['systemctl', 'enable', '--now', 'disk-usage-trend.timer'], check=True)
     print(f'Installed. Backup manifest: {backup / "manifest.json"}')
-    print('Existing banner and disk summaries preserved; static rankings replaced by 15-row graphs.')
+    print('Existing banner preserved; capacity, free space and rankings integrated into 15-row graphs.')
     return backup
 
 

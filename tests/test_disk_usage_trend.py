@@ -155,8 +155,8 @@ class TrendTest(unittest.TestCase):
         positions = []
         for source in sources:
             self.assertNotIn('cat '+source['report'], changed)
-            self.assertEqual(changed.count(installer.summary_command(source['id'])),1)
-            positions.extend([changed.index(installer.summary_command(source['id'])), changed.index(installer.chart_command(source['id']))])
+            self.assertNotIn(installer.summary_command(source['id']),changed)
+            positions.append(changed.index(installer.chart_command(source['id'])))
         self.assertEqual(positions, sorted(positions))
         legacy = original
         for source in sources:
@@ -275,7 +275,7 @@ class TrendTest(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(self.config['database'])) as db:
             self.assertEqual(db.execute('SELECT * FROM snapshots').fetchall(),before)
             history=trend.load_share_history(db,'home',NOW-timedelta(days=14),NOW)
-        self.assertEqual(history.names,['alice','bob','其他/保留','空余空间'])
+        self.assertEqual(history.names,['alice','bob','Others','空余'])
         self.assertEqual(trend.share_percentages(history.amounts[-1],history.totals[-1]),[50,25,12.5,12.5])
 
     def test_unranked_share_stays_in_other_and_does_not_invent_usage(self):
@@ -313,7 +313,7 @@ class TrendTest(unittest.TestCase):
     def test_share_chart_keeps_top_five_sizes_and_free_share_readable(self):
         unit=1024**3
         amounts=[20*unit,10*unit,8*unit,6*unit,4*unit,47*unit,5*unit]
-        names=[f'user{i}' for i in range(1,6)]+['其他/保留','空余空间']
+        names=[f'user{i}' for i in range(1,6)]+['Others','空余']
         history=trend.ShareHistory([NOW-timedelta(days=2),NOW-timedelta(days=1)],names,
                                    [amounts,amounts],[100*unit,100*unit],list(zip(names[:5],amounts[:5])))
         chart=trend.render_share_chart({'id':'home'},history,NOW-timedelta(days=14),NOW,color=True)
@@ -321,14 +321,48 @@ class TrendTest(unittest.TestCase):
         self.assertEqual(len(graph),15)
         self.assertTrue(all(trend.display_width(line)<=80 for line in graph))
         self.assertIn('100%',chart);self.assertIn('0%',chart)
-        self.assertIn('当前 Top 5:',chart)
+        self.assertNotIn('当前 Top 5:',chart)
+        self.assertLessEqual(len(chart.splitlines()),19)
         for i,value in enumerate((20,10,8,6,4),1):self.assertIn(f'{i} user{i} {value} GiB',chart)
-        self.assertIn('O 其他/保留 47 GiB',chart)
-        self.assertIn('F 空余空间 5 GiB',chart)
-        self.assertIn('F: 5.0%',chart)
+        self.assertIn('O Others 47 GiB',chart)
+        self.assertIn('9 空余 5 GiB',chart)
+        self.assertIn('9 空余 5 GiB 5.0%',chart)
         self.assertTrue('█' in chart or '▄' in chart)
         self.assertEqual(trend.percent_text(0.005),'<0.01%')
         self.assertEqual(trend.percent_text(0.05),'0.05%')
+
+    def test_eight_users_plus_free_and_others_fit_compact_chart(self):
+        unit=1024**3
+        amounts=[unit]*8+[81*unit,11*unit]
+        names=[f'username_{i}' for i in range(1,9)]+['Others','空余']
+        history=trend.ShareHistory([NOW-timedelta(days=1)],names,[amounts],[100*unit],list(zip(names[:8],amounts[:8])))
+        chart=trend.render_share_chart({'id':'home'},history,NOW-timedelta(days=14),NOW,color=True)
+        self.assertEqual(len(chart.splitlines()),19)
+        self.assertTrue(all(trend.display_width(line)<=80 for line in chart.splitlines()))
+        for i in range(1,9):self.assertIn(f'{i} username_{i} 1 GiB 1.0%',chart)
+        self.assertIn('9 空余 11 GiB 11.0%',chart)
+        self.assertIn('O Others 81 GiB 81.0%',chart)
+
+    def test_compact_v2_migration_removes_only_duplicate_summaries(self):
+        sources=installer.CONFIG['sources']
+        old='#!/bin/sh\necho "banner"\n'+''.join(installer.summary_command(s['id'])+'\n'+installer.chart_command(s['id'])+'\n' for s in sources)+'# disk-usage-trend: compact-v2\n'
+        new=installer.interleave_hook(old,sources)
+        self.assertIn('echo "banner"',new)
+        self.assertIn('compact-v3',new)
+        self.assertNotIn(' summary ',new)
+        self.assertEqual(installer.interleave_hook(new,sources),new)
+        with self.assertRaises(ValueError):installer.interleave_hook(old.replace('--quiet','--changed',1),sources)
+
+    def test_expand_scan_ranking_preserves_schedule_and_other_jobs(self):
+        expander=module('expand_topk',ROOT/'disk-trend/expand_topk.py')
+        old='# get_user_topk /home 5 > /var/cache/home_topk_user\n0 2 * * * /home/xfan/.local/bin/get_user_topk /home 5 > /var/cache/home_topk_user\n0 8 * * * unrelated_job\n'
+        new=expander.expand(old,expander.HOME)
+        self.assertEqual(new,old.replace('/bin/get_user_topk /home 5','/bin/get_user_topk /home 8'))
+        self.assertEqual(expander.expand(new,expander.HOME),new)
+        piped=old.replace(' > /var/cache/home_topk_user',' | sudo tee /var/cache/home_topk_user > /dev/null')
+        self.assertEqual(expander.expand(piped,expander.HOME),piped.replace('/bin/get_user_topk /home 5','/bin/get_user_topk /home 8'))
+        with self.assertRaises(ValueError):expander.expand(old+old,expander.HOME)
+        with self.assertRaises(ValueError):expander.expand(old.replace('/home 5','/home 6'),expander.HOME)
 
     def test_one_point_readonly_show_and_empty_period(self):
         self.write_report()

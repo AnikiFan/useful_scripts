@@ -485,7 +485,7 @@ def load_share_history(connection, source_id, start, end, *, named_limit=8):
     current_rows = connection.execute('SELECT name,bytes FROM usages WHERE snapshot_id=? ORDER BY rank',
                                       (snapshots[-1][0],)).fetchall()
     selected = current_rows[:named_limit]
-    names = [name for name, _ in selected] + ['其他/保留', '空余空间']
+    names = [name for name, _ in selected] + ['Others', '空余']
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     metadata = {}
     if {'disk_capacity', 'disk_space'} <= tables:
@@ -545,7 +545,7 @@ def share_columns(history, start, end, columns):
 def share_style(count):
     """Return stable per-chart IDs and colors, with gray Other and white Free."""
     user_colors = (96, 93, 95, 92, 94, 91, 35, 32)
-    return ([str(i+1) for i in range(count-2)] + ['O', 'F'],
+    return ([str(i+1) for i in range(count-2)] + ['O', '9'],
             list(user_colors[:count-2]) + [90, 97])
 
 
@@ -553,33 +553,25 @@ def share_color(text, code, enabled):
     return f'\033[{code}m{text}\033[0m' if enabled else text
 
 
-def share_legend(history, width, color):
-    """Keep current Top 5 names and absolute sizes readable in a compact legend."""
-    ids, colors = share_style(len(history.names))
-    lines, line = [], f'  当前 Top {min(5, len(history.current_rows))}: '
-    for index, (name, value) in enumerate(zip(history.names, history.amounts[-1])):
-        if index in (5, len(history.names)-2):
-            if line.strip():
-                lines.append(line.rstrip())
-            line = '  更多用户: ' if index == 5 and index < len(history.names)-2 else '  其他份额: '
-        entry = f'{ids[index]} {safe_text(name)} {human_bytes(value)}'
-        max_width = width - 4
-        while display_width(entry) > max_width:
-            name = name[:-1]
-            entry = f'{ids[index]} {safe_text(name)}… {human_bytes(value)}'
-        if display_width(line + entry) > width:
-            lines.append(line.rstrip())
-            line = '  '
-        line += share_color(entry, colors[index], color) + '  '
-    if line.strip():
-        lines.append(line.rstrip())
-    return lines
+def share_labels(history, percentages, width):
+    """Put names, absolute usage and percentages beside the matching areas."""
+    ids, _ = share_style(len(history.names))
+    result = []
+    for key, name, value, percent in zip(ids, history.names, history.amounts[-1], percentages):
+        name = safe_text(name)
+        suffix = f' {human_bytes(value)} {percent_text(percent)}'
+        available = width - display_width(key + ' ' + suffix)
+        if display_width(name) > available:
+            while name and display_width(name + '…') > available:
+                name = name[:-1]
+            name += '…'
+        result.append(f'{key} {name}{suffix}')
+    return result
 
 
 def render_share_chart(source, history, start, end, *, width=80, height=15, color=False):
     """Draw a 100-percent stacked area using eighth-block terminal cells."""
-    title = (f"磁盘份额 · {safe_text(source.get('label', source['id']))} · "
-             f'{start.astimezone():%m-%d}—{end.astimezone():%m-%d} · 0–100%')
+    title = f"磁盘份额 · {safe_text(source.get('label', source['id']))}"
     if not history.times:
         return title + '\n  此时间段尚无历史观测。\n'
     if history.amounts[-1] is None:
@@ -590,8 +582,8 @@ def render_share_chart(source, history, start, end, *, width=80, height=15, colo
     ids, colors = share_style(len(history.names))
     if len(ids) > height:
         raise ValueError(f'完整份额标注至少需要 {len(ids)} 行')
-    label_texts = [f'{key}: {percent_text(value)}' for key, value in zip(ids, latest)]
-    label_width = max(8, max(map(len, label_texts)))
+    label_texts = share_labels(history, latest, max(20, width // 2))
+    label_width = max(display_width(label) for label in label_texts)
     columns = max(10, width - 10 - label_width)
     pixels = share_columns(history, start, end, columns)
     y_ticks = {round((100-value)/100*(height-1)): f'{value}%' for value in (0,25,50,75,100)}
@@ -610,7 +602,8 @@ def render_share_chart(source, history, start, end, *, width=80, height=15, colo
         rows[i] = min(rows[i], height-1 if i==len(rows)-1 else rows[i+1]-1)
     labels = {row:index for row,(_,index) in zip(rows,targets)}
     complete = sum(value is not None for value in history.amounts)
-    lines = [title, f'  最新观测 {history.times[-1].astimezone():%m-%d %H:%M}；{complete} 个完整份额快照；以整盘容量为 100%。']
+    title += f' · 总 {human_bytes(history.totals[-1])}'
+    lines = [title]
     lower_blocks = ' ▁▂▃▄▅▆▇█'
     for row in range(height):
         chars = []
@@ -646,19 +639,17 @@ def render_share_chart(source, history, start, end, *, width=80, height=15, colo
                         break
                     count += 1
                 chars.append(f'\033[{colors[bottom]};{colors[top]+10}m{lower_blocks[count]}\033[0m')
-        value = share_color(label_texts[labels[row]].ljust(label_width),colors[labels[row]],color) if row in labels else ' '*label_width
+        value = share_color(label_texts[labels[row]] + ' ' * (label_width - display_width(label_texts[labels[row]])),colors[labels[row]],color) if row in labels else ' '*label_width
         mark = '├' if row in y_ticks else '│'
         lines.append(f'{y_ticks.get(row, ""):>5} {mark}'+''.join(chars)+' │ '+value)
-    lines.append('      └'+''.join('┬' if column in grid_columns else '─' for column in range(columns))+'   最新份额')
+    lines.append('      └'+''.join('┬' if column in grid_columns else '─' for column in range(columns))+'   排名 / 用量 / 占比')
     axis = [' ']*columns
     for column,label in x_ticks:
         offset=max(0,min(columns-len(label),column-len(label)//2))
         axis[offset:offset+len(label)]=label
     lines.append('       '+''.join(axis))
-    lines.extend(share_legend(history,width,color))
-    lines.append('  未单列用量归入 O（其他/保留）；F 为空余，空白为缺测。')
-    if complete == 1:
-        lines.append('  目前只有一个完整份额快照，先显示单列；后续形成堆叠面积。')
+    note = '单列待累积' if complete == 1 else f'{complete} 帧'
+    lines.append(f'  更新 {history.times[-1].astimezone():%m-%d %H:%M} · {note} · 1–8排名 9空余 O Others · 空白=缺测')
     return '\n'.join(lines)+'\n'
 
 
