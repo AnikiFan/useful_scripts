@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import tempfile
 
@@ -27,7 +28,10 @@ exec /usr/bin/python3 -I /usr/local/libexec/disk-usage-trend.py "$@"
 '''
 MOTD = '''#!/bin/sh
 # Only reads the local SQLite history. Never scans disks during login.
-/usr/local/bin/disk_usage_trend show --width 80 --height 9 --color never --quiet || :
+if grep -qx '# disk-usage-trend: interleaved-v1' /etc/update-motd.d/99-custom-message 2>/dev/null; then
+    exit 0
+fi
+/usr/local/bin/disk_usage_trend show --width 80 --height 9 --color always --quiet || :
 '''
 SERVICE = '''[Unit]
 Description=Record existing disk Top 5 cache snapshots
@@ -62,6 +66,47 @@ WantedBy=timers.target
 '''
 
 
+def interleave_hook(text, sources):
+    """Insert a graph after each known report; refuse ambiguous partial layouts."""
+    marker = '# disk-usage-trend: interleaved-v1'
+    if marker in text.splitlines():
+        for source in sources:
+            if text.count(chart_command(source['id'])) != 1:
+                raise ValueError('Managed MOTD layout was edited; inspect before updating')
+        return text
+    lines = text.splitlines(keepends=True)
+    matches = {}
+    for index, line in enumerate(lines):
+        try:
+            command = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        for source in sources:
+            if command == ['cat', source['report']]:
+                if source['id'] in matches.values():
+                    raise ValueError('Duplicate report in MOTD; inspect before updating')
+                matches[index] = source['id']
+    if not matches:
+        return None
+    if len(matches) != len(sources):
+        raise ValueError('Only some reports matched MOTD; inspect before updating')
+    output = []
+    for index, line in enumerate(lines):
+        output.append(line)
+        if index in matches:
+            if not line.endswith('\n'):
+                output.append('\n')
+            output.append(chart_command(matches[index]) + '\n')
+    output.append(marker + '\n')
+    return ''.join(output)
+
+
+def chart_command(source_id):
+    """Generate a safe source-specific graph command for a cached MOTD."""
+    return ('/usr/local/bin/disk_usage_trend show --source ' + shlex.quote(source_id) +
+            ' --width 80 --height 9 --color always --quiet || :')
+
+
 def install(root, *, activate=False):
     """Back up replaced files, preserve existing config, and write atomically."""
     source = Path(__file__).resolve().parent.parent / 'disk_usage_trend'
@@ -73,8 +118,16 @@ def install(root, *, activate=False):
         'etc/systemd/system/disk-usage-trend.timer': (TIMER.encode(), 0o644),
     }
     config_name = 'etc/disk-usage-trend.json'
+    config = CONFIG
     if not (root / config_name).exists():
         files[config_name] = ((json.dumps(CONFIG, ensure_ascii=False, indent=2)+'\n').encode(), 0o644)
+    else:
+        config = json.loads((root / config_name).read_text())
+    original_hook = root / 'etc/update-motd.d/99-custom-message'
+    if original_hook.exists():
+        interleaved = interleave_hook(original_hook.read_text(), config['sources'])
+        if interleaved is not None:
+            files['etc/update-motd.d/99-custom-message'] = (interleaved.encode(), original_hook.stat().st_mode & 0o777)
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
     backup = root / 'var/backups/disk-usage-trend' / stamp
     backup.mkdir(parents=True, mode=0o700)
@@ -109,7 +162,7 @@ def install(root, *, activate=False):
         subprocess.run(['systemctl', 'start', 'disk-usage-trend.service'], check=True)
         subprocess.run(['systemctl', 'enable', '--now', 'disk-usage-trend.timer'], check=True)
     print(f'Installed. Backup manifest: {backup / "manifest.json"}')
-    print('Original 99-custom-message and existing disk scan schedules are unchanged.')
+    print('Existing banner and reports preserved; matching reports now have inline graphs.')
     return backup
 
 

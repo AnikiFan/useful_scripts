@@ -13,7 +13,9 @@ sudo /usr/bin/python3 -I /path/to/useful_scripts/disk-trend/install.py
 ```
 
 安装程序会保存被替换文件及清单到 `/var/backups/disk-usage-trend/<timestamp>/`。
-它保留既有 `/etc/update-motd.d/99-custom-message`、磁盘扫描定时任务及缓存文件；
+它保留既有登录说明、排行榜、磁盘扫描定时任务及缓存文件；
+自动在 `99-custom-message` 中每份已识别的排行榜之后插入对应历史图，
+并停用尾部重复显示。遇到只匹配部分排行榜的自定义布局会中止，供管理员检查；
 若 `/etc/disk-usage-trend.json` 已存在，也保留管理员对该文件的修改。
 
 新增内容：
@@ -21,7 +23,7 @@ sudo /usr/bin/python3 -I /path/to/useful_scripts/disk-trend/install.py
 - `/usr/local/libexec/disk-usage-trend.py`：root 所有的程序副本。
 - `/usr/local/bin/disk_usage_trend`：使用 `/usr/bin/python3 -I` 的启动器。
 - `/etc/disk-usage-trend.json`：默认时间段、历史保留天数、三个缓存来源。
-- `/etc/update-motd.d/99-z-disk-trends`：在原有登录提示之后显示曲线。
+- `/etc/update-motd.d/99-z-disk-trends`：未使用交错布局时的备用显示入口。
 - `disk-usage-trend.service` / `disk-usage-trend.timer`：每小时采集缓存。
 - `/var/lib/disk-usage-trend/history.sqlite3`：每台服务器本机的历史数据库。
 
@@ -59,7 +61,10 @@ disk_usage_trend show --source storage2 --color always
   零值不进入对数坐标；相邻快照超过 48 小时也不连线。
 - 用量继承原文本报告的精度，例如 `1.0 TiB` 已有四舍五入；并非新增逐字节统计。
   统计对象沿用原报告中的目录，可能包括备份等非用户账号目录。
-- 曲线用 `1`–`5` 对应图例标识；`*` 表示同一个终端字符格中有多条曲线重叠。
+- 曲线使用 Braille 点阵：每个字符格包含 2×4 个绘图点，默认图形仍占 9 行。
+  五条曲线分别使用青、黄、紫、绿、蓝色，与下方明确标记的 `图例 / Legend` 一一对应。
+  同一字符格中的多条曲线交替使用相应图例颜色；无颜色输出在曲线末端附近标注数字。
+  登录显示默认启用颜色，因为 MOTD 生成时不一定连接终端；手动查看可用 `--color never`。
 - 正在写入、不完整、符号链接或异常类型的报告会跳过，不覆盖已有历史。
 
 ## 验证、预览和撤回
@@ -75,6 +80,7 @@ sudo /etc/update-motd.d/99-z-disk-trends
 
 `--destdir` 仅生成安装目录树，不执行 systemctl，不修改系统登录提示。
 撤回新增功能时停用 `disk-usage-trend.timer`，删除新增的
-`/etc/update-motd.d/99-z-disk-trends`，即可停止采集和登录显示。
+`/etc/update-motd.d/99-z-disk-trends`，并从安装备份恢复修改前的 `99-custom-message`，
+即可停止采集和登录显示。
 其余新增文件可按安装备份清单移除；若清单记录了被替换文件，应恢复对应备份。
 数据库可保留以便以后恢复；原有磁盘信息、Top 5 报告和扫描任务始终保留。

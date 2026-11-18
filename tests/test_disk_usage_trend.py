@@ -119,7 +119,46 @@ class TrendTest(unittest.TestCase):
         chart = trend.render_chart({'id':'home'},times,[('alice',1024**4)],
                                    [[1024**4,None,1024**4,1024**4]],start,NOW)
         graph = '\n'.join(line.split('│',1)[1] for line in chart.splitlines() if '│' in line)
-        self.assertEqual(graph.count('1'),3)  # three points, no fabricated connecting line
+        dots = sum(bin(ord(char) - 0x2800).count('1') for char in graph if '\u2800' <= char <= '\u28ff')
+        self.assertEqual(dots, 3)  # three points, no fabricated connecting line
+
+    def test_braille_uses_eight_subpixels_in_one_character(self):
+        self.assertEqual(sum(sum(row) for row in trend.BRAILLE_BITS), 255)
+        start = NOW - timedelta(days=14)
+        values = [[2 ** exponent] for exponent in (38.0, 38.03)]
+        cells, _ = trend.curve_cells([NOW-timedelta(days=1)], values, start, NOW, 38, 39, 67, 9)
+        masks = [cell for row in cells for cell in row if len(cell) == 2]
+        self.assertEqual(len(masks), 1)
+        self.assertNotEqual(masks[0][1], masks[0][2])
+
+    def test_color_legend_matches_curves_without_growing_plot(self):
+        start = NOW - timedelta(days=14)
+        times = [NOW-timedelta(days=2), NOW-timedelta(days=1)]
+        names = [('alice', 2**40), ('bob', 2**38)]
+        chart = trend.render_chart({'id':'home'}, times, names,
+                                   [[2**39, 2**40], [2**37, 2**38]], start, NOW, color=True)
+        graph = [line for line in chart.splitlines() if '│' in line]
+        self.assertEqual(len(graph), 9)
+        self.assertTrue(all(trend.display_width(line) <= 80 for line in graph))
+        self.assertIn('\x1b[96m━ 1 alice\x1b[0m', chart)
+        self.assertIn('\x1b[93m━ 2 bob\x1b[0m', chart)
+        self.assertTrue(any('\x1b[96m' in line for line in graph))
+        self.assertTrue(any('\x1b[93m' in line for line in graph))
+        self.assertTrue(all(trend.display_width(line) <= 80 for line in trend.legend_lines(names, 80, True)))
+
+    def test_interleaved_motd_preserves_banner_and_is_idempotent(self):
+        sources = installer.CONFIG['sources']
+        original = '#!/bin/sh\necho "existing banner"\n' + ''.join('cat '+s['report']+'\necho ""\n' for s in sources)
+        changed = installer.interleave_hook(original, sources)
+        self.assertEqual(installer.interleave_hook(changed, sources), changed)
+        self.assertIn('echo "existing banner"\n', changed)
+        positions = []
+        for source in sources:
+            self.assertEqual(changed.count('cat '+source['report']), 1)
+            positions.extend([changed.index('cat '+source['report']), changed.index(installer.chart_command(source['id']))])
+        self.assertEqual(positions, sorted(positions))
+        with self.assertRaises(ValueError):
+            installer.interleave_hook('cat '+sources[0]['report']+'\n', sources)
 
     def test_one_point_readonly_show_and_empty_period(self):
         self.write_report()

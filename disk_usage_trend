@@ -17,7 +17,6 @@ import shutil
 import sqlite3
 import stat
 import sys
-import textwrap
 import unicodedata
 
 UTC = timezone.utc
@@ -235,10 +234,75 @@ def segment(x0, y0, x1, y1):
             y0 += sy
 
 
+PALETTE = (96, 93, 95, 92, 94)
+BRAILLE_BITS = ((1, 8), (2, 16), (4, 32), (64, 128))
+
+
+def curve_cells(times, series, start, end, low, high, columns, height):
+    """Rasterize at 2x4 subpixels per terminal cell, preserving observation gaps."""
+    cells = [[{} for _ in range(columns)] for _ in range(height)]
+    endpoints = {}
+    pixel_width, pixel_height = columns * 2, height * 4
+    duration = (end - start).total_seconds()
+    for index, values in enumerate(series, 1):
+        previous = None
+        for timestamp, value in zip(times, values):
+            if value is None or value <= 0:
+                previous = None
+                continue
+            x = min(pixel_width - 1, max(0, round(
+                (timestamp - start).total_seconds() / duration * (pixel_width - 1))))
+            y = logarithmic_row(value, low, high, pixel_height)
+            if previous is not None and timestamp - previous[2] <= timedelta(hours=48):
+                pixels = segment(previous[0], previous[1], x, y)
+            else:
+                pixels = [(x, y)]
+            for column, row in pixels:
+                cell = cells[row // 4][column // 2]
+                cell[index] = cell.get(index, 0) | BRAILLE_BITS[row % 4][column % 2]
+            endpoints[index] = (x // 2, y // 4)
+            previous = (x, y, timestamp)
+    return cells, endpoints
+
+
+def display_width(text):
+    """Count terminal columns, excluding ANSI colors and combining marks."""
+    return sum(0 if unicodedata.combining(char) else
+               2 if unicodedata.east_asian_width(char) in ('W', 'F') else 1
+               for char in ANSI.sub('', text))
+
+
+def colored(text, index, enabled):
+    """Use exactly the same series palette in the graph and legend."""
+    return f'\033[{PALETTE[(index - 1) % len(PALETTE)]}m{text}\033[0m' if enabled else text
+
+
+def legend_lines(names, width, color):
+    """Wrap complete legend entries without counting invisible color escapes."""
+    lines = []
+    line = '  图例 / Legend: '
+    for index, (name, _) in enumerate(names, 1):
+        name = safe_text(name)
+        max_name_width = max(8, width - 12)
+        if display_width(name) > max_name_width:
+            while display_width(name) > max_name_width - 1:
+                name = name[:-1]
+            name += '…'
+        entry = colored(f'━ {index} {name}', index, color)
+        if display_width(line + entry) > width:
+            lines.append(line.rstrip())
+            line = '  '
+        line += entry + '  '
+    lines.append(line.rstrip())
+    return lines
+
+
 def render_chart(source, times, names, series, start, end, *, width=80, height=9, color=False):
-    """Draw five labeled trajectories; missing/zero values never become fake lines."""
+    """Draw high-resolution Braille curves in the original terminal footprint."""
     label = safe_text(source.get('label', source['id']))
-    title = f"磁盘趋势 · {label} · {start.astimezone():%Y-%m-%d} — {end.astimezone():%Y-%m-%d} · log₂"
+    date_format = "%Y-%m-%d" if (end - start).days > 180 else "%m-%d"
+    period = f"{start.astimezone():{date_format}}—{end.astimezone():{date_format}}"
+    title = f"磁盘趋势 · {label} · {period} · log₂"
     if not times:
         return title + '\n  此时间段尚无历史观测。\n'
     positive = [value for values in series for value in values if value is not None and value > 0]
@@ -248,52 +312,53 @@ def render_chart(source, times, names, series, start, end, *, width=80, height=9
         return title + '\n' + info + '\n  用量均为 0 B；对数轴无法显示零值。\n'
     low, high = math.floor(math.log2(min(positive))), math.ceil(math.log2(max(positive)))
     if low == high:
-        low, high = max(0, low-1), high+1
-    columns = max(24, width-13)
-    cells = [[set() for _ in range(columns)] for _ in range(height)]
-    duration = (end-start).total_seconds()
-    for index, values in enumerate(series, 1):
-        previous = None
-        for timestamp, value in zip(times, values):
-            if value is None or value <= 0:
-                previous = None
-                continue
-            x = min(columns-1, max(0, round((timestamp-start).total_seconds()/duration*(columns-1))))
-            y = logarithmic_row(value, low, high, height)
-            if previous is not None and (timestamp-previous[2]).total_seconds() <= 48*3600:
-                pixels = segment(previous[0], previous[1], x, y)
-            else:
-                pixels = [(x,y)]
-            for column, row in pixels:
-                cells[row][column].add(index)
-            previous = (x,y,timestamp)
+        low, high = max(0, low - 1), high + 1
+    columns = max(24, width - 13)
+    cells, endpoints = curve_cells(times, series, start, end, low, high, columns, height)
+    # Keep monochrome output identifiable without replacing any curve pixels.
+    markers = {}
+    if not color:
+        for index, (x, y) in endpoints.items():
+            for offset in (1, -1, 2, -2, 3, -3, 4, -4, 5, -5):
+                column = x + offset
+                if 0 <= column < columns and not cells[y][column] and (y, column) not in markers:
+                    markers[y, column] = str(index)
+                    break
     ticks = {}
-    stride = max(1, math.ceil((high-low)/(height-1)))
-    for exponent in sorted(set(range(low,high+1,stride)) | {low,high}):
-        ticks[logarithmic_row(2**exponent,low,high,height)] = human_bytes(2**exponent)
-    palette = [36, 33, 35, 32, 34]
+    stride = max(1, math.ceil((high - low) / (height - 1)))
+    for exponent in sorted(set(range(low, high + 1, stride)) | {low, high}):
+        row = logarithmic_row(2 ** exponent, low, high, height * 4) // 4
+        ticks[row] = human_bytes(2 ** exponent)
     lines = [title, info]
     for row in range(height):
         chars = []
-        for ids in cells[row]:
-            character = '*' if len(ids)>1 else str(next(iter(ids))) if ids else ' '
-            if color and len(ids)==1:
-                character = f'\033[{palette[(next(iter(ids))-1)%5]}m{character}\033[0m'
+        for column, cell in enumerate(cells[row]):
+            mask = 0
+            for bits in cell.values():
+                mask |= bits
+            character = chr(0x2800 + mask) if mask else markers.get((row, column), ' ')
+            if color and len(cell) == 1:
+                character = colored(character, next(iter(cell)), True)
+            elif color and len(cell) > 1:
+                # A terminal cell has one foreground color. Alternate the
+                # participating series instead of hiding all overlaps in white.
+                index = sorted(cell)[(row + column) % len(cell)]
+                character = colored(character, index, True)
             chars.append(character)
-        lines.append(f'{ticks.get(row, ""):>10} │'+''.join(chars))
-    lines.append('           └'+'─'*columns)
-    axis = [' ']*columns
-    for fraction in [0,0.5,1]:
-        stamp = (start+(end-start)*fraction).astimezone().strftime('%m-%d')
-        offset = max(0,min(columns-len(stamp),round(fraction*(columns-1))-len(stamp)//2))
-        axis[offset:offset+len(stamp)] = stamp
-    lines.append('            '+''.join(axis))
-    legend = ' · '.join(f'{i} {safe_text(name)} {human_bytes(size)}' for i,(name,size) in enumerate(names,1))
-    lines.extend(textwrap.wrap(legend,width=max(40,width),initial_indent='  ',subsequent_indent='  '))
-    lines.append('  数字标识各条曲线，* 为重叠；缺测/不在当时榜单/0 B 处留空。')
-    if len(times)==1:
+        lines.append(f'{ticks.get(row, ""):>10} │' + ''.join(chars))
+    lines.append('           └' + '─' * columns)
+    axis = [' '] * columns
+    for fraction in (0, 0.5, 1):
+        stamp = (start + (end - start) * fraction).astimezone().strftime('%m-%d')
+        offset = max(0, min(columns - len(stamp), round(fraction * (columns - 1)) - len(stamp) // 2))
+        axis[offset:offset + len(stamp)] = stamp
+    lines.append('            ' + ''.join(axis))
+    lines.extend(legend_lines(names, width, color))
+    lines.append('  同格重叠曲线交替着色；缺测/未上榜/0 B 处留空。' if color else
+                 '  曲线末端数字对应图例；缺测/未上榜/0 B 处留空。')
+    if len(times) == 1:
         lines.append('  目前只有一个真实快照，尚不能形成变化曲线；后续自动累积。')
-    return '\n'.join(lines)+'\n'
+    return '\n'.join(lines) + '\n'
 
 
 def show(config, *, start, end, source_id=None, width=80, height=9, color=False):
