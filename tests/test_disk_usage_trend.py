@@ -118,7 +118,7 @@ class TrendTest(unittest.TestCase):
         times = [start+timedelta(days=i) for i in [1,2,3,10]]
         chart = trend.render_chart({'id':'home'},times,[('alice',1024**4)],
                                    [[1024**4,None,1024**4,1024**4]],start,NOW)
-        graph = '\n'.join(line.split('│',1)[1] for line in chart.splitlines() if '│' in line)
+        graph = '\n'.join(line.split('│')[1] for line in chart.splitlines() if '│' in line)
         dots = sum(bin(ord(char) - 0x2800).count('1') for char in graph if '\u2800' <= char <= '\u28ff')
         self.assertEqual(dots, 3)  # three points, no fabricated connecting line
 
@@ -159,6 +159,23 @@ class TrendTest(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         with self.assertRaises(ValueError):
             installer.interleave_hook('cat '+sources[0]['report']+'\n', sources)
+
+    def test_latest_values_never_overlap_or_expand_chart(self):
+        names = [(f'user{i}', 1024**4) for i in range(5)]
+        labels = trend.latest_value_labels(names, 39, 41, 5)
+        self.assertEqual(sorted(labels), list(range(5)))
+        self.assertEqual([labels[row][0] for row in sorted(labels)], [1,2,3,4,5])
+        for width in (40,80):
+            chart = trend.render_chart({'id':'home'}, [NOW-timedelta(hours=1)], names,
+                                       [[value] for _,value in names], NOW-timedelta(days=14), NOW,
+                                       width=width, height=9, color=True)
+            graph = [line for line in chart.splitlines() if '│' in line]
+            self.assertEqual(len(graph), 9)
+            self.assertTrue(all(trend.display_width(line) <= width for line in graph))
+            values = '\n'.join(line.split('│')[-1] for line in graph)
+            for index in range(1,6):
+                self.assertIn(f'{index}: 1 TiB', values)
+            self.assertIn('最新值', chart)
 
     def test_one_point_readonly_show_and_empty_period(self):
         self.write_report()

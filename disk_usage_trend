@@ -297,6 +297,20 @@ def legend_lines(names, width, color):
     return lines
 
 
+def latest_value_labels(names, low, high, height):
+    """Place latest values near their curves without overlapping label rows."""
+    ordered = sorted(enumerate(names, 1), key=lambda item: (-item[1][1], item[0]))
+    rows = []
+    for index, (_, value) in ordered:
+        desired = logarithmic_row(value, low, high, height * 4) // 4 if value > 0 else height - 1
+        rows.append(max(desired, rows[-1] + 1 if rows else 0))
+    for position in range(len(rows) - 1, -1, -1):
+        ceiling = height - 1 if position == len(rows) - 1 else rows[position + 1] - 1
+        rows[position] = min(rows[position], ceiling)
+    return {row: (index, f'{index}: {human_bytes(value)}')
+            for row, (index, (_, value)) in zip(rows, ordered)}
+
+
 def render_chart(source, times, names, series, start, end, *, width=80, height=9, color=False):
     """Draw high-resolution Braille curves in the original terminal footprint."""
     label = safe_text(source.get('label', source['id']))
@@ -313,7 +327,9 @@ def render_chart(source, times, names, series, start, end, *, width=80, height=9
     low, high = math.floor(math.log2(min(positive))), math.ceil(math.log2(max(positive)))
     if low == high:
         low, high = max(0, low - 1), high + 1
-    columns = max(24, width - 13)
+    latest_labels = latest_value_labels(names, low, high, height)
+    value_width = max(6, max(len(text) for _, text in latest_labels.values()))
+    columns = max(10, width - 15 - value_width)
     cells, endpoints = curve_cells(times, series, start, end, low, high, columns, height)
     # Keep monochrome output identifiable without replacing any curve pixels.
     markers = {}
@@ -345,17 +361,19 @@ def render_chart(source, times, names, series, start, end, *, width=80, height=9
                 index = sorted(cell)[(row + column) % len(cell)]
                 character = colored(character, index, True)
             chars.append(character)
-        lines.append(f'{ticks.get(row, ""):>10} │' + ''.join(chars))
-    lines.append('           └' + '─' * columns)
+        index, value_text = latest_labels.get(row, (1, ''))
+        value_text = colored(value_text.ljust(value_width), index, color and bool(value_text))
+        lines.append(f'{ticks.get(row, ""):>10} │' + ''.join(chars) + ' │ ' + value_text)
+    lines.append('           └' + '─' * columns + '   最新值')
     axis = [' '] * columns
-    for fraction in (0, 0.5, 1):
+    for fraction in ((0, 0.5, 1) if columns >= 18 else (0, 1)):
         stamp = (start + (end - start) * fraction).astimezone().strftime('%m-%d')
         offset = max(0, min(columns - len(stamp), round(fraction * (columns - 1)) - len(stamp) // 2))
         axis[offset:offset + len(stamp)] = stamp
     lines.append('            ' + ''.join(axis))
     lines.extend(legend_lines(names, width, color))
-    lines.append('  同格重叠曲线交替着色；缺测/未上榜/0 B 处留空。' if color else
-                 '  曲线末端数字对应图例；缺测/未上榜/0 B 处留空。')
+    lines.append('  右侧为最新用量；同格重叠交替着色，缺测留空。' if color else
+                 '  右侧编号对应图例；缺测/未上榜/0 B 曲线留空。')
     if len(times) == 1:
         lines.append('  目前只有一个真实快照，尚不能形成变化曲线；后续自动累积。')
     return '\n'.join(lines) + '\n'
