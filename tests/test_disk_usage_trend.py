@@ -118,7 +118,7 @@ class TrendTest(unittest.TestCase):
         times = [start+timedelta(days=i) for i in [1,2,3,10]]
         chart = trend.render_chart({'id':'home'},times,[('alice',1024**4)],
                                    [[1024**4,None,1024**4,1024**4]],start,NOW)
-        graph = '\n'.join(line.split('│')[1] for line in chart.splitlines() if '│' in line)
+        graph = '\n'.join(line[12:].split('│')[0] for line in chart.splitlines() if '│' in line)
         dots = sum(bin(ord(char) - 0x2800).count('1') for char in graph if '\u2800' <= char <= '\u28ff')
         self.assertEqual(dots, 3)  # three points, no fabricated connecting line
 
@@ -136,7 +136,7 @@ class TrendTest(unittest.TestCase):
         times = [NOW-timedelta(days=2), NOW-timedelta(days=1)]
         names = [('alice', 2**40), ('bob', 2**38)]
         chart = trend.render_chart({'id':'home'}, times, names,
-                                   [[2**39, 2**40], [2**37, 2**38]], start, NOW, color=True)
+                                   [[2**39, 2**40], [2**37, 2**38]], start, NOW, color=True, height=9)
         graph = [line for line in chart.splitlines() if '│' in line]
         self.assertEqual(len(graph), 9)
         self.assertTrue(all(trend.display_width(line) <= 80 for line in graph))
@@ -154,9 +154,16 @@ class TrendTest(unittest.TestCase):
         self.assertIn('echo "existing banner"\n', changed)
         positions = []
         for source in sources:
-            self.assertEqual(changed.count('cat '+source['report']), 1)
-            positions.extend([changed.index('cat '+source['report']), changed.index(installer.chart_command(source['id']))])
+            self.assertNotIn('cat '+source['report'], changed)
+            self.assertEqual(changed.count(installer.summary_command(source['id'])),1)
+            positions.extend([changed.index(installer.summary_command(source['id'])), changed.index(installer.chart_command(source['id']))])
         self.assertEqual(positions, sorted(positions))
+        legacy = original
+        for source in sources:
+            report = 'cat '+source['report']+'\n'
+            legacy = legacy.replace(report, report+installer.chart_command(source['id']).replace('--height 15','--height 9')+'\n')
+        legacy += '# disk-usage-trend: interleaved-v1\n'
+        self.assertEqual(installer.interleave_hook(legacy,sources),changed)
         with self.assertRaises(ValueError):
             installer.interleave_hook('cat '+sources[0]['report']+'\n', sources)
 
@@ -204,7 +211,7 @@ class TrendTest(unittest.TestCase):
     def test_six_series_with_free_space_keep_nine_rows(self):
         names=[(f'user{i}',1024**4) for i in range(5)]+[('剩余空间',0)]
         chart=trend.render_chart({'id':'home'},[NOW-timedelta(hours=1)],names,
-                                 [[value] for _,value in names],NOW-timedelta(days=14),NOW,color=True)
+                                 [[value] for _,value in names],NOW-timedelta(days=14),NOW,color=True,height=9)
         graph=[line for line in chart.splitlines() if '│' in line]
         self.assertEqual(len(graph),9)
         self.assertTrue(all(trend.display_width(line)<=80 for line in graph))
@@ -213,6 +220,48 @@ class TrendTest(unittest.TestCase):
         self.assertIn('Top 5 + 剩余空间',chart)
         with self.assertRaises(ValueError):
             trend.latest_value_labels(names,39,41,5)
+
+    def test_grid_and_ticks_preserve_curve_pixels_and_dimensions(self):
+        start=NOW-timedelta(days=14)
+        times=[NOW-timedelta(days=2),NOW-timedelta(days=1)]
+        chart=trend.render_chart({'id':'home'},times,[('alice',2**40)],[[2**39,2**40]],start,NOW,color=True,height=9)
+        graph=[line for line in chart.splitlines() if '│' in line]
+        self.assertEqual(len(graph),9)
+        self.assertTrue(all(trend.display_width(line)<=80 for line in graph))
+        self.assertIn('\x1b[90m┄\x1b[0m',chart)
+        self.assertIn('\x1b[90m┆\x1b[0m',chart)
+        self.assertIn('├',chart)
+        baseline=next(line for line in chart.splitlines() if '└' in line)
+        self.assertEqual(baseline.count('┬'),5)
+        plain_graph=[trend.ANSI.sub('',line)[12:].split('│')[0] for line in graph]
+        cells,_=trend.curve_cells(times,[[2**39,2**40]],start,NOW,39,40,len(plain_graph[0])-1,9)
+        for row,values in enumerate(cells):
+            for column,cell in enumerate(values):
+                if cell:
+                    self.assertEqual(plain_graph[row][column],chr(0x2800+cell[1]))
+
+    def test_time_ticks_adapt_to_narrow_and_short_windows(self):
+        self.assertEqual(len(trend.time_ticks(NOW-timedelta(days=14),NOW,13)),2)
+        self.assertEqual(len(trend.time_ticks(NOW-timedelta(days=14),NOW,30)),3)
+        ticks=trend.time_ticks(NOW-timedelta(hours=12),NOW,53)
+        self.assertEqual(len(ticks),5)
+        self.assertTrue(all(':' in label for _,label in ticks))
+
+    def test_disk_summary_keeps_capacity_without_static_ranking(self):
+        summary='💾 磁盘剩余空间 · 📂 /home\n  💿 /dev/test · 总 2 TiB · 🆓 剩 256 GiB\n'
+        self.write_report(summary+'\n'+REPORT)
+        before=self.cache.read_bytes()
+        output=trend.show_summary(self.config,source_id='home')
+        self.assertIn('🆓 剩 256 GiB',output)
+        self.assertIn('总 2 TiB',output)
+        self.assertNotIn('alice',output)
+        self.assertNotIn('占用空间 Top',output)
+        self.assertEqual(self.cache.read_bytes(),before)
+
+    def test_default_graph_height_is_fifteen(self):
+        chart=trend.render_chart({'id':'home'},[NOW-timedelta(hours=1)],[('alice',2**40)],
+                                 [[2**40]],NOW-timedelta(days=14),NOW)
+        self.assertEqual(sum('│' in line for line in chart.splitlines()),15)
 
     def test_one_point_readonly_show_and_empty_period(self):
         self.write_report()

@@ -13,8 +13,8 @@ sudo /usr/bin/python3 -I /path/to/useful_scripts/disk-trend/install.py
 ```
 
 安装程序会备份已有 SQLite 历史数据库，并保存被替换文件及清单到 `/var/backups/disk-usage-trend/<timestamp>/`。
-它保留既有登录说明、排行榜、磁盘扫描定时任务及缓存文件；
-自动在 `99-custom-message` 中每份已识别的排行榜之后插入对应历史图，
+它保留既有登录说明、磁盘扫描定时任务及完整缓存文件；
+在 `99-custom-message` 中将每份静态排行榜改为“磁盘容量/已用/剩余摘要 + 历史图”，
 并停用尾部重复显示。遇到只匹配部分排行榜的自定义布局会中止，供管理员检查；
 若 `/etc/disk-usage-trend.json` 已存在，也保留管理员对该文件的修改。
 
@@ -27,7 +27,8 @@ sudo /usr/bin/python3 -I /path/to/useful_scripts/disk-trend/install.py
 - `disk-usage-trend.service` / `disk-usage-trend.timer`：每小时采集缓存。
 - `/var/lib/disk-usage-trend/history.sqlite3`：每台服务器本机的历史数据库。
 
-登录提示只读取本机数据库，不扫描磁盘，也不等待 NFS。
+趋势图只读取本机数据库，不扫描磁盘，也不等待 NFS；磁盘摘要读取原有小型报告缓存，
+其中共享磁盘摘要仍依赖原缓存所在的 NFS。
 每台服务器分别保留本机 `/home` 历史；两个共享存储的历史在各节点中各存一份，
 避免通过 NFS 共享 SQLite 数据库锁。采集只读三个很小的文本报告，
 不会重复执行昂贵的磁盘用量扫描。
@@ -38,7 +39,8 @@ sudo /usr/bin/python3 -I /path/to/useful_scripts/disk-trend/install.py
 ## 查看和设置时间段
 
 ```sh
-disk_usage_trend show                             # 默认过去两周
+disk_usage_trend summary --source home             # 仅显示磁盘空间摘要
+disk_usage_trend show                             # 默认过去两周、15行
 disk_usage_trend show --days 30                    # 过去30天
 disk_usage_trend show --since 2026-11-01 --until 2026-11-15
 disk_usage_trend show --source home --width 100 --height 15
@@ -59,14 +61,16 @@ disk_usage_trend show --source storage2 --color always
 - 每张图跟踪所选时间段最后一次快照中的 Top 5 目录，并增加第 6 条白色“剩余空间”曲线。
   剩余空间采用原报告的可用空间口径（与报告中的“🆓 剩”一致）；
   升级时只为内容哈希一致的现有快照补录缓存中确实存在的数值，不反推旧日期。
-  旧缓存缺少这一字段时继续显示原 Top 5。六项右侧数值至少需要 `--height 6`，默认仍为 9 行。
+  旧缓存缺少这一字段时继续显示原 Top 5。六项右侧数值至少需要 `--height 6`，默认使用 15 行。
   用户此前未上榜时无法从 Top 5 缓存知道其用量，相关日期留空；
   零值不进入对数坐标；相邻快照超过 48 小时也不连线。
 - 用量继承原文本报告的精度，例如 `1.0 TiB` 已有四舍五入；并非新增逐字节统计。
   统计对象沿用原报告中的目录，可能包括备份等非用户账号目录。
-- 曲线使用 Braille 点阵：每个字符格包含 2×4 个绘图点，默认图形仍占 9 行。
+- 曲线使用 Braille 点阵：每个字符格包含 2×4 个绘图点，默认图形占 15 行。
+  淡灰色水平网格对应 log₂ 用量刻度，垂直网格对应时间刻度，曲线覆盖网格显示。
+  默认宽度提供 5 个时间刻度，窄图自动减少，短于两天的窗口显示时分。
   图形右侧标注各曲线最新用量，编号和颜色与图例一致；接近的数值错开显示，
-  整体宽度和图形高度保持不变。Top 5 曲线分别使用青、黄、紫、绿、蓝色，剩余空间使用白色，与下方明确标记的 `图例 / Legend` 一一对应。
+  默认宽度为 80 列，图形高度可用 `--height` 调整。Top 5 曲线分别使用青、黄、紫、绿、蓝色，剩余空间使用白色，与下方明确标记的 `图例 / Legend` 一一对应。
   同一字符格中的多条曲线交替使用相应图例颜色；无颜色输出在曲线末端附近标注数字。
   登录显示默认启用颜色，因为 MOTD 生成时不一定连接终端；手动查看可用 `--color never`。
 - 正在写入、不完整、符号链接或异常类型的报告会跳过，不覆盖已有历史。
@@ -79,7 +83,7 @@ python3 disk-trend/install.py --destdir /tmp/disk-trend-install-preview
 sudo systemctl status disk-usage-trend.timer
 sudo journalctl -u disk-usage-trend.service --no-pager -n 20
 disk_usage_trend show
-sudo /etc/update-motd.d/99-z-disk-trends
+sudo /etc/update-motd.d/99-custom-message
 ```
 
 `--destdir` 仅生成安装目录树，不执行 systemctl，不修改系统登录提示。

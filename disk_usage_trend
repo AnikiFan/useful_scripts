@@ -91,7 +91,7 @@ def parse_free_space(text):
     return value
 
 
-def read_observation(path, *, now=None, minimum_age=60):
+def read_report_bytes(path, *, now=None, minimum_age=60):
     """Reject incomplete, oversized, or currently changing cache files."""
     now = now or datetime.now(UTC)
     # Cache directories can be user-writable: never follow a final symlink or
@@ -110,6 +110,12 @@ def read_observation(path, *, now=None, minimum_age=60):
         raise ValueError('报告正在更新')
     if not raw.endswith(b'\n'):
         raise ValueError('报告尚未写完')
+    return after, raw
+
+
+def read_observation(path, *, now=None, minimum_age=60):
+    """Read one stable report and derive its usage and free-space observation."""
+    after, raw = read_report_bytes(path, now=now, minimum_age=minimum_age)
     text = raw.decode('utf-8')
     return Observation(after.st_mtime_ns, hashlib.sha256(raw).hexdigest(),
                        parse_report(text), parse_free_space(text))
@@ -347,7 +353,16 @@ def latest_value_labels(names, low, high, height):
             for row, (index, (_, value)) in zip(rows, ordered)}
 
 
-def render_chart(source, times, names, series, start, end, *, width=80, height=9, color=False):
+def time_ticks(start, end, columns):
+    """Fit readable time ticks into the existing horizontal plotting area."""
+    count = 5 if columns >= 40 else 3 if columns >= 18 else 2
+    date_format = '%H:%M' if end - start <= timedelta(days=2) else '%m-%d'
+    return [(round(i * (columns - 1) / (count - 1)),
+             (start + (end - start) * (i / (count - 1))).astimezone().strftime(date_format))
+            for i in range(count)]
+
+
+def render_chart(source, times, names, series, start, end, *, width=80, height=15, color=False):
     """Draw high-resolution Braille curves in the original terminal footprint."""
     label = safe_text(source.get('label', source['id']))
     date_format = "%Y-%m-%d" if (end - start).days > 180 else "%m-%d"
@@ -383,6 +398,8 @@ def render_chart(source, times, names, series, start, end, *, width=80, height=9
     for exponent in sorted(set(range(low, high + 1, stride)) | {low, high}):
         row = logarithmic_row(2 ** exponent, low, high, height * 4) // 4
         ticks[row] = human_bytes(2 ** exponent)
+    horizontal_ticks = time_ticks(start, end, columns)
+    grid_columns = {column for column, _ in horizontal_ticks}
     lines = [title, info]
     for row in range(height):
         chars = []
@@ -398,15 +415,25 @@ def render_chart(source, times, names, series, start, end, *, width=80, height=9
                 # participating series instead of hiding all overlaps in white.
                 index = sorted(cell)[(row + column) % len(cell)]
                 character = colored(character, index, True)
+            elif not mask and (row, column) not in markers:
+                if row in ticks and column in grid_columns:
+                    character = '┼'
+                elif row in ticks:
+                    character = '┄'
+                elif column in grid_columns:
+                    character = '┆'
+                if color and character != ' ':
+                    character = f'\033[90m{character}\033[0m'
             chars.append(character)
         index, value_text = latest_labels.get(row, (1, ''))
         value_text = colored(value_text.ljust(value_width), index, color and bool(value_text))
-        lines.append(f'{ticks.get(row, ""):>10} │' + ''.join(chars) + ' │ ' + value_text)
-    lines.append('           └' + '─' * columns + '   最新值')
+        axis_mark = '├' if row in ticks else '│'
+        lines.append(f'{ticks.get(row, ""):>10} {axis_mark}' + ''.join(chars) + ' │ ' + value_text)
+    baseline = ''.join('┬' if column in grid_columns else '─' for column in range(columns))
+    lines.append('           └' + baseline + '   最新值')
     axis = [' '] * columns
-    for fraction in ((0, 0.5, 1) if columns >= 18 else (0, 1)):
-        stamp = (start + (end - start) * fraction).astimezone().strftime('%m-%d')
-        offset = max(0, min(columns - len(stamp), round(fraction * (columns - 1)) - len(stamp) // 2))
+    for column, stamp in horizontal_ticks:
+        offset = max(0, min(columns - len(stamp), column - len(stamp) // 2))
         axis[offset:offset + len(stamp)] = stamp
     lines.append('            ' + ''.join(axis))
     lines.extend(legend_lines(names, width, color))
@@ -417,7 +444,7 @@ def render_chart(source, times, names, series, start, end, *, width=80, height=9
     return '\n'.join(lines) + '\n'
 
 
-def show(config, *, start, end, source_id=None, width=80, height=9, color=False):
+def show(config, *, start, end, source_id=None, width=80, height=15, color=False):
     """Read local history only; login never reads or scans network storage."""
     sources = [s for s in config['sources'] if source_id is None or s['id']==source_id]
     if not sources:
@@ -428,10 +455,29 @@ def show(config, *, start, end, source_id=None, width=80, height=9, color=False)
                                       start,end,width=width,height=height,color=color) for source in sources)
 
 
+def show_summary(config, *, source_id=None):
+    """Keep the original capacity/free-space summary, omitting its static ranking."""
+    sources = [s for s in config['sources'] if source_id is None or s['id'] == source_id]
+    if not sources:
+        raise ValueError('未知数据源')
+    summaries = []
+    for source in sources:
+        _, raw = read_report_bytes(Path(source['report']), minimum_age=0)
+        text = ANSI.sub('', raw.decode('utf-8'))
+        heading = re.search(r'(?m)^.*🏆\s*占用空间\s+Top\s+\d+.*$', text)
+        if heading is None:
+            raise ValueError('报告缺少排行榜分界，未输出不完整摘要')
+        summary = text[:heading.start()].strip()
+        if '💾' not in summary or '🆓' not in summary:
+            raise ValueError('报告缺少磁盘空间摘要')
+        summaries.append('\n'.join(safe_text(line) for line in summary.splitlines()))
+    return '\n\n'.join(summaries) + '\n'
+
+
 def main(argv=None):
     """Run collection or user-selectable history rendering."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',choices=['collect','show'])
+    parser.add_argument('command',choices=['collect','show','summary'])
     parser.add_argument('--config',type=Path,default=DEFAULT_CONFIG)
     parser.add_argument('--quiet',action='store_true',help='失败时静默退出，供登录提示使用')
     parser.add_argument('--source',help='仅显示 home / storage / storage2')
@@ -440,7 +486,7 @@ def main(argv=None):
     group.add_argument('--since',help='起始日期或ISO时间')
     parser.add_argument('--until',help='结束日期或ISO时间；日期包含当日')
     parser.add_argument('--width',type=int,default=min(120,shutil.get_terminal_size((80,24)).columns))
-    parser.add_argument('--height',type=int,default=9)
+    parser.add_argument('--height',type=int,default=15)
     parser.add_argument('--color',choices=['auto','always','never'],default='auto')
     args = parser.parse_args(argv)
     try:
@@ -449,6 +495,8 @@ def main(argv=None):
             for source,result in collect(config):
                 if not args.quiet:
                     print(f'{source}: {result}')
+        elif args.command == 'summary':
+            print(show_summary(config, source_id=args.source), end='')
         else:
             if not 40<=args.width<=200 or not 5<=args.height<=30:
                 raise ValueError('width须为40–200，height须为5–30')
