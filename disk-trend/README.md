@@ -1,94 +1,83 @@
-# 登录时显示磁盘 Top 5 历史曲线
+# 登录时显示磁盘容量份额历史
 
-`disk_usage_trend` 读取现有 `get_user_topk` 文本缓存，将每次更新存为 SQLite
-快照，同时记录该报告中的磁盘剩余空间，再在终端绘制用量与剩余空间曲线。默认展示过去 14 天，纵轴为以 2 为底的对数，
-例如 256 GiB、512 GiB、1 TiB 的刻度等距。仅依赖 Linux 的 Python 3.8+ 标准库。
+`disk_usage_trend` 读取现有 `get_user_topk` 文本缓存，将每次更新保存为本机 SQLite
+快照，在终端显示百分比堆叠面积图。默认过去 14 天、80 列、15 行绘图区，
+纵轴固定 0–100%，以原报告的整盘总容量为分母。
 
-## 安装
+每块磁盘按“容量/已用/剩余摘要 → 份额图 → 图例”排列。图例直接显示当前
+Top 5 的姓名与 GiB/TiB 用量，右侧显示相应百分比。原来的重复静态排行榜不再显示，
+完整排行榜缓存仍然保留，继续用于采集。
 
-在每台需要显示本机 `/home` 历史的服务器上执行：
+## 份额口径
+
+- 按最新快照中的排名单列用户/目录。程序支持单列最多 8 项；现有缓存只保存 Top 5，
+  因而当前显示五个用户份额，以及 `O 其他/保留` 和 `F 空余空间`。
+- `O = 整盘总容量 - 已单列目录用量 - 可用空余空间`，包含未单列目录、系统占用、
+  文件系统保留空间及原报告舍入差额，不能解释成一个用户。
+- `F` 使用原报告“🆓 剩”的可用空间，与登录摘要一致。零值也可正常表示。
+- 所有份额合计为 100%；不会把 Top 5 单独归一化成 100%。容量口径无法核对时不绘制
+  该快照，仍提示原因并显示当前 Top 5 大小。
+- 用户在旧快照中未被单列时，其未知用量归入 `O`，不能把当时未显示的个人份额理解为实际零用量。
+- 用户颜色对应图例，`O` 为灰色，`F` 为白色。使用八分之一字符块显示面积边界；
+  极小份额可能小于终端分辨率，准确读数以右侧百分比和图例大小为准。
+- 用量和容量继承原报告的四舍五入精度。缓存统计对象是目录，可能包含非账号的备份目录。
+
+## 安装或升级
+
+在每台服务器上执行：
 
 ```sh
 sudo /usr/bin/python3 -I /path/to/useful_scripts/disk-trend/install.py
 ```
 
-安装程序会备份已有 SQLite 历史数据库，并保存被替换文件及清单到 `/var/backups/disk-usage-trend/<timestamp>/`。
-它保留既有登录说明、磁盘扫描定时任务及完整缓存文件；
-在 `99-custom-message` 中将每份静态排行榜改为“磁盘容量/已用/剩余摘要 + 历史图”，
-并停用尾部重复显示。遇到只匹配部分排行榜的自定义布局会中止，供管理员检查；
-若 `/etc/disk-usage-trend.json` 已存在，也保留管理员对该文件的修改。
+安装程序将被替换文件及 SQLite 数据库备份到
+`/var/backups/disk-usage-trend/<timestamp>/`，保留管理员配置、登录说明和原有扫描计划。
+它识别既有三组报告或旧版交错布局，再迁移为容量摘要与份额图；自定义布局无法明确匹配时停止。
 
-新增内容：
+系统文件：
 
-- `/usr/local/libexec/disk-usage-trend.py`：root 所有的程序副本。
-- `/usr/local/bin/disk_usage_trend`：使用 `/usr/bin/python3 -I` 的启动器。
-- `/etc/disk-usage-trend.json`：默认时间段、历史保留天数、三个缓存来源。
-- `/etc/update-motd.d/99-z-disk-trends`：未使用交错布局时的备用显示入口。
-- `disk-usage-trend.service` / `disk-usage-trend.timer`：每小时采集缓存。
-- `/var/lib/disk-usage-trend/history.sqlite3`：每台服务器本机的历史数据库。
+- `/usr/local/libexec/disk-usage-trend.py` 与 `/usr/local/bin/disk_usage_trend`：root 所有的程序及启动器。
+- `/etc/disk-usage-trend.json`：来源路径、默认时间范围和保留天数。
+- `/etc/update-motd.d/99-custom-message`：保留登录说明，按来源展示摘要和图。
+- `/etc/update-motd.d/99-z-disk-trends`：备用入口；检测到已迁移布局时自动静默。
+- `disk-usage-trend.service` / `disk-usage-trend.timer`：每小时采集小型缓存。
+- `/var/lib/disk-usage-trend/history.sqlite3`：本机历史，默认保留 365 天。
 
-趋势图只读取本机数据库，不扫描磁盘，也不等待 NFS；磁盘摘要读取原有小型报告缓存，
-其中共享磁盘摘要仍依赖原缓存所在的 NFS。
-每台服务器分别保留本机 `/home` 历史；两个共享存储的历史在各节点中各存一份，
-避免通过 NFS 共享 SQLite 数据库锁。采集只读三个很小的文本报告，
-不会重复执行昂贵的磁盘用量扫描。
+绘图仅读取本机 SQLite；空间摘要读取原报告缓存（共享存储缓存仍在 NFS）。
+不会在登录时扫描磁盘。各节点本地保留共享存储观测，避免通过 NFS 共享数据库锁。
+需 Linux、Python 3.8+、systemd、update-motd；只使用 Python 标准库。
+源码更新后需重新安装系统副本。
 
-需要 Python 3、systemd，以及正在使用 update-motd 的登录配置。
-程序更新后重新执行安装步骤，系统副本不会随用户目录脚本更新而自动改变。
-
-## 查看和设置时间段
+## 查看
 
 ```sh
-disk_usage_trend summary --source home             # 仅显示磁盘空间摘要
-disk_usage_trend show                             # 默认过去两周、15行
-disk_usage_trend show --days 30                    # 过去30天
+disk_usage_trend show                            # 默认百分比堆叠图
+disk_usage_trend show --days 30
 disk_usage_trend show --since 2026-11-01 --until 2026-11-15
-disk_usage_trend show --source home --width 100 --height 15
-disk_usage_trend show --source storage2 --color always
+disk_usage_trend show --source home --width 100 --height 20
+disk_usage_trend show --style lines              # 保留的旧版 log₂ 用量曲线
+disk_usage_trend summary --source home           # 仅容量摘要
 ```
 
-日期按服务器本地时区解释；结束日期包含当天。也支持带时区的 ISO 时间。
-`--source` 可选 `home`、`storage`、`storage2`。若要修改所有用户登录时的默认时间段，
-编辑 `/etc/disk-usage-trend.json` 中的 `default_days`，无需重启服务。
-历史默认保留 365 天，可调整 `retention_days`（14–3650 天）。
+日期按本地时区解释，结束日期包含当天；也接受带时区的 ISO 时间。
+来源为 `home`、`storage`、`storage2`。修改配置的 `default_days` 可调整登录默认范围。
+百分比图至少需要足够行数放置全部份额标注，默认 15 行；窄图会自动减少时间刻度。
 
-## 数据含义与限制
+## 历史与验证
 
-- 历史从首次采集现有缓存开始，无法恢复部署前不存在的时间序列。
-  一个真实快照仅显示点，并明确提示尚无足够历史形成曲线。
-- 横轴使用原缓存的文件修改时间。每小时轮询同一缓存不会生成伪造的新数据点。
-  展示最新观测时间，便于发现原扫描任务没有更新。
-- 每张图跟踪所选时间段最后一次快照中的 Top 5 目录，并增加第 6 条白色“剩余空间”曲线。
-  剩余空间采用原报告的可用空间口径（与报告中的“🆓 剩”一致）；
-  升级时只为内容哈希一致的现有快照补录缓存中确实存在的数值，不反推旧日期。
-  旧缓存缺少这一字段时继续显示原 Top 5。六项右侧数值至少需要 `--height 6`，默认使用 15 行。
-  用户此前未上榜时无法从 Top 5 缓存知道其用量，相关日期留空；
-  零值不进入对数坐标；相邻快照超过 48 小时也不连线。
-- 用量继承原文本报告的精度，例如 `1.0 TiB` 已有四舍五入；并非新增逐字节统计。
-  统计对象沿用原报告中的目录，可能包括备份等非用户账号目录。
-- 曲线使用 Braille 点阵：每个字符格包含 2×4 个绘图点，默认图形占 15 行。
-  淡灰色水平网格对应 log₂ 用量刻度，垂直网格对应时间刻度，曲线覆盖网格显示。
-  默认宽度提供 5 个时间刻度，窄图自动减少，短于两天的窗口显示时分。
-  图形右侧标注各曲线最新用量，编号和颜色与图例一致；接近的数值错开显示，
-  默认宽度为 80 列，图形高度可用 `--height` 调整。Top 5 曲线分别使用青、黄、紫、绿、蓝色，剩余空间使用白色，与下方明确标记的 `图例 / Legend` 一一对应。
-  同一字符格中的多条曲线交替使用相应图例颜色；无颜色输出在曲线末端附近标注数字。
-  登录显示默认启用颜色，因为 MOTD 生成时不一定连接终端；手动查看可用 `--color never`。
-- 正在写入、不完整、符号链接或异常类型的报告会跳过，不覆盖已有历史。
-
-## 验证、预览和撤回
+总容量、空余空间都来自同一份原报告，并沿用其修改时间。
+升级只给内容哈希相同的已有快照补录真实缓存字段；不会把今天的容量倒填到旧日期。
+缺少完整容量信息的日期留空，可用 `--style lines` 查看原有用量历史。
+只有一个完整快照时显示一列，未来采样累积后形成堆叠面积；只在相邻完整快照间距
+不超过 48 小时时连接，缺测不连接，不向最新观测之后外推。
 
 ```sh
 python3 -m unittest discover -s tests -v
 python3 disk-trend/install.py --destdir /tmp/disk-trend-install-preview
 sudo systemctl status disk-usage-trend.timer
 sudo journalctl -u disk-usage-trend.service --no-pager -n 20
-disk_usage_trend show
 sudo /etc/update-motd.d/99-custom-message
 ```
 
-`--destdir` 仅生成安装目录树，不执行 systemctl，不修改系统登录提示。
-撤回新增功能时停用 `disk-usage-trend.timer`，删除新增的
-`/etc/update-motd.d/99-z-disk-trends`，并从安装备份恢复修改前的 `99-custom-message`，
-即可停止采集和登录显示。
-其余新增文件可按安装备份清单移除；若清单记录了被替换文件，应恢复对应备份。
-数据库可保留以便以后恢复；原有磁盘信息、Top 5 报告和扫描任务始终保留。
+`--destdir` 仅生成安装目录树，不运行 systemctl。撤回时停用 timer，删除备用钩子，
+并恢复备份的 `99-custom-message`；其他系统文件按备份清单恢复。数据库可保留。

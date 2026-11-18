@@ -263,16 +263,83 @@ class TrendTest(unittest.TestCase):
                                  [[2**40]],NOW-timedelta(days=14),NOW)
         self.assertEqual(sum('│' in line for line in chart.splitlines()),15)
 
+    def test_capacity_upgrade_preserves_snapshots_and_uses_whole_disk(self):
+        self.write_report('📦 总 2 TiB · 🆓 剩 256 GiB\n'+REPORT)
+        trend.collect(self.config,now=NOW)
+        with contextlib.closing(sqlite3.connect(self.config['database'])) as db:
+            before=db.execute('SELECT * FROM snapshots').fetchall()
+            db.execute('DROP TABLE disk_capacity');db.commit()
+            history=trend.load_share_history(db,'home',NOW-timedelta(days=14),NOW)
+            self.assertIsNone(history.amounts[-1])
+        trend.collect(self.config,now=NOW)
+        with contextlib.closing(sqlite3.connect(self.config['database'])) as db:
+            self.assertEqual(db.execute('SELECT * FROM snapshots').fetchall(),before)
+            history=trend.load_share_history(db,'home',NOW-timedelta(days=14),NOW)
+        self.assertEqual(history.names,['alice','bob','其他/保留','空余空间'])
+        self.assertEqual(trend.share_percentages(history.amounts[-1],history.totals[-1]),[50,25,12.5,12.5])
+
+    def test_unranked_share_stays_in_other_and_does_not_invent_usage(self):
+        self.write_report('📦 总 2 TiB · 🆓 剩 256 GiB\n'+REPORT,days=2)
+        trend.collect(self.config,now=NOW)
+        self.write_report('📦 总 2 TiB · 🆓 剩 256 GiB\n'+REPORT.replace('alice','carol'),days=1)
+        trend.collect(self.config,now=NOW)
+        with contextlib.closing(sqlite3.connect(self.config['database'])) as db:
+            history=trend.load_share_history(db,'home',NOW-timedelta(days=14),NOW)
+        self.assertEqual(trend.share_percentages(history.amounts[0],history.totals[0]),[0,25,62.5,12.5])
+        self.assertEqual(trend.share_percentages(history.amounts[1],history.totals[1]),[50,25,12.5,12.5])
+
+    def test_inconsistent_totals_are_not_normalized_to_fake_shares(self):
+        self.write_report('📦 总 1 TiB · 🆓 剩 256 GiB\n'+REPORT)
+        trend.collect(self.config,now=NOW)
+        with contextlib.closing(sqlite3.connect(self.config['database'])) as db:
+            history=trend.load_share_history(db,'home',NOW-timedelta(days=14),NOW)
+        self.assertIsNone(history.amounts[-1])
+        with self.assertRaises(ValueError):
+            trend.share_percentages([60,60],100)
+
+    def test_share_interpolation_preserves_hundred_percent_and_missing_gaps(self):
+        start=NOW-timedelta(days=14)
+        times=[start+timedelta(days=day) for day in (1,2,3,10)]
+        history=trend.ShareHistory(times,['a','其他/保留','空余空间'],
+                                   [[20,60,20],[40,40,20],None,[10,70,20]],[100,100,None,100],[('a',10)])
+        columns=trend.share_columns(history,start,NOW,141)
+        for values in columns:
+            if values is not None:self.assertAlmostEqual(sum(values),100)
+        self.assertEqual(columns[15],[30,50,20])
+        self.assertIsNone(columns[30])
+        self.assertIsNone(columns[70])
+        self.assertIsNone(columns[140])
+
+    def test_share_chart_keeps_top_five_sizes_and_free_share_readable(self):
+        unit=1024**3
+        amounts=[20*unit,10*unit,8*unit,6*unit,4*unit,47*unit,5*unit]
+        names=[f'user{i}' for i in range(1,6)]+['其他/保留','空余空间']
+        history=trend.ShareHistory([NOW-timedelta(days=2),NOW-timedelta(days=1)],names,
+                                   [amounts,amounts],[100*unit,100*unit],list(zip(names[:5],amounts[:5])))
+        chart=trend.render_share_chart({'id':'home'},history,NOW-timedelta(days=14),NOW,color=True)
+        graph=[line for line in chart.splitlines() if '│' in line]
+        self.assertEqual(len(graph),15)
+        self.assertTrue(all(trend.display_width(line)<=80 for line in graph))
+        self.assertIn('100%',chart);self.assertIn('0%',chart)
+        self.assertIn('当前 Top 5:',chart)
+        for i,value in enumerate((20,10,8,6,4),1):self.assertIn(f'{i} user{i} {value} GiB',chart)
+        self.assertIn('O 其他/保留 47 GiB',chart)
+        self.assertIn('F 空余空间 5 GiB',chart)
+        self.assertIn('F: 5.0%',chart)
+        self.assertTrue('█' in chart or '▄' in chart)
+        self.assertEqual(trend.percent_text(0.005),'<0.01%')
+        self.assertEqual(trend.percent_text(0.05),'0.05%')
+
     def test_one_point_readonly_show_and_empty_period(self):
         self.write_report()
         trend.collect(self.config, now=NOW)
         start,end = trend.get_window(now=NOW)
         before = Path(self.config['database']).stat().st_mtime_ns
-        chart = trend.show(self.config,start=start,end=end)
+        chart = trend.show(self.config,start=start,end=end,style="lines")
         self.assertIn('只有一个真实快照',chart)
         self.assertIn('1 TiB',chart)
         self.assertEqual(Path(self.config['database']).stat().st_mtime_ns,before)
-        self.assertIn('尚无历史观测',trend.show(self.config,start=NOW,end=NOW+timedelta(days=1)))
+        self.assertIn('尚无历史观测',trend.show(self.config,start=NOW,end=NOW+timedelta(days=1),style="lines"))
 
     def test_retention_deletes_child_rows(self):
         self.config['retention_days'] = 14

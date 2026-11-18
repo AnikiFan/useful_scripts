@@ -37,6 +37,9 @@ CREATE INDEX IF NOT EXISTS snapshot_time ON snapshots(source, timestamp_ns);
 CREATE TABLE IF NOT EXISTS disk_space (
     snapshot_id INTEGER PRIMARY KEY REFERENCES snapshots(id) ON DELETE CASCADE,
     free_bytes INTEGER NOT NULL CHECK(free_bytes >= 0));
+CREATE TABLE IF NOT EXISTS disk_capacity (
+    snapshot_id INTEGER PRIMARY KEY REFERENCES snapshots(id) ON DELETE CASCADE,
+    total_bytes INTEGER NOT NULL CHECK(total_bytes > 0));
 '''
 
 
@@ -47,6 +50,7 @@ class Observation:
     digest: str
     rows: tuple
     free_bytes: int | None = None
+    total_bytes: int | None = None
 
 
 def safe_text(value):
@@ -91,6 +95,17 @@ def parse_free_space(text):
     return value
 
 
+def parse_capacity(text):
+    """Read total filesystem capacity without estimating it from named users."""
+    match = re.search(r'📦\s*总\s+(\d+(?:\.\d+)?)\s+(B|[KMGTPE]iB|[kMGTPE]B)\b', ANSI.sub('', text))
+    if match is None:
+        return None
+    value = int(Decimal(match[1]) * UNITS[match[2]])
+    if not 0 < value <= 2**63 - 1:
+        raise ValueError('总容量无效')
+    return value
+
+
 def read_report_bytes(path, *, now=None, minimum_age=60):
     """Reject incomplete, oversized, or currently changing cache files."""
     now = now or datetime.now(UTC)
@@ -118,7 +133,7 @@ def read_observation(path, *, now=None, minimum_age=60):
     after, raw = read_report_bytes(path, now=now, minimum_age=minimum_age)
     text = raw.decode('utf-8')
     return Observation(after.st_mtime_ns, hashlib.sha256(raw).hexdigest(),
-                       parse_report(text), parse_free_space(text))
+                       parse_report(text), parse_free_space(text), parse_capacity(text))
 
 
 def load_config(path):
@@ -151,6 +166,9 @@ def store_observation(connection, source, observation):
             # Upgrade only this exact cached snapshot, never infer older values.
             connection.execute('INSERT OR IGNORE INTO disk_space(snapshot_id,free_bytes) VALUES (?,?)',
                                (old[0], observation.free_bytes))
+        if observation.total_bytes is not None:
+            connection.execute('INSERT OR IGNORE INTO disk_capacity(snapshot_id,total_bytes) VALUES (?,?)',
+                               (old[0], observation.total_bytes))
         return False
     cursor = connection.execute('INSERT INTO snapshots(source,timestamp_ns,digest) VALUES (?,?,?)',
                                 (source, observation.timestamp_ns, observation.digest))
@@ -160,6 +178,9 @@ def store_observation(connection, source, observation):
     if observation.free_bytes is not None:
         connection.execute('INSERT INTO disk_space(snapshot_id,free_bytes) VALUES (?,?)',
                            (cursor.lastrowid, observation.free_bytes))
+    if observation.total_bytes is not None:
+        connection.execute('INSERT INTO disk_capacity(snapshot_id,total_bytes) VALUES (?,?)',
+                           (cursor.lastrowid, observation.total_bytes))
     return True
 
 
@@ -444,13 +465,213 @@ def render_chart(source, times, names, series, start, end, *, width=80, height=1
     return '\n'.join(lines) + '\n'
 
 
-def show(config, *, start, end, source_id=None, width=80, height=15, color=False):
+@dataclass
+class ShareHistory:
+    """Capacity-based components; None means incomplete or inconsistent metadata."""
+    times: list
+    names: list
+    amounts: list
+    totals: list
+    current_rows: list
+
+
+def load_share_history(connection, source_id, start, end, *, named_limit=8):
+    """Account for every byte as named usage, other/reserved, or available space."""
+    snapshots = connection.execute(
+        'SELECT id,timestamp_ns FROM snapshots WHERE source=? AND timestamp_ns>=? AND timestamp_ns<? ORDER BY timestamp_ns',
+        (source_id, int(start.timestamp()*10**9), int(end.timestamp()*10**9))).fetchall()
+    if not snapshots:
+        return ShareHistory([], [], [], [], [])
+    current_rows = connection.execute('SELECT name,bytes FROM usages WHERE snapshot_id=? ORDER BY rank',
+                                      (snapshots[-1][0],)).fetchall()
+    selected = current_rows[:named_limit]
+    names = [name for name, _ in selected] + ['其他/保留', '空余空间']
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    metadata = {}
+    if {'disk_capacity', 'disk_space'} <= tables:
+        metadata = {row[0]: row[1:] for row in connection.execute(
+            'SELECT s.id,c.total_bytes,d.free_bytes FROM snapshots s JOIN disk_capacity c ON c.snapshot_id=s.id '
+            'JOIN disk_space d ON d.snapshot_id=s.id WHERE s.source=?', (source_id,))}
+    amounts, totals = [], []
+    for snapshot_id, _ in snapshots:
+        total, free = metadata.get(snapshot_id, (None, None))
+        values = dict(connection.execute('SELECT name,bytes FROM usages WHERE snapshot_id=?', (snapshot_id,)))
+        named = [values.get(name, 0) for name, _ in selected]
+        # Not ranked does not mean zero usage: that unmeasured share stays in Other.
+        if total is None or free is None or total <= 0 or total < free + sum(values.values()):
+            amounts.append(None)
+            totals.append(None)
+        else:
+            amounts.append(named + [total - free - sum(named), free])
+            totals.append(total)
+    return ShareHistory([datetime.fromtimestamp(ts/10**9, UTC) for _, ts in snapshots],
+                        names, amounts, totals, current_rows)
+
+
+def share_percentages(amounts, total):
+    """Use total disk capacity as the denominator; never normalize just Top 5."""
+    if total <= 0 or any(value < 0 for value in amounts) or sum(amounts) != total:
+        raise ValueError('份额无法与总容量核对到 100%')
+    return [100 * value / total for value in amounts]
+
+
+def percent_text(value):
+    """Keep tiny nonzero available-space shares distinguishable from zero."""
+    if 0 < value < 0.01:
+        return '<0.01%'
+    return f'{value:.2f}%' if 0 < value < 0.1 else f'{value:.1f}%'
+
+
+def share_columns(history, start, end, columns):
+    """Interpolate only between complete neighboring snapshots within 48 hours."""
+    result = [None] * columns
+    previous = None
+    for timestamp, amounts, total in zip(history.times, history.amounts, history.totals):
+        if amounts is None:
+            previous = None
+            continue
+        values = share_percentages(amounts, total)
+        x = min(columns-1, max(0, round((timestamp-start).total_seconds() /
+                                       (end-start).total_seconds() * (columns-1))))
+        if previous is not None and timestamp - previous[2] <= timedelta(hours=48) and x > previous[0]:
+            for column in range(previous[0], x + 1):
+                fraction = (column-previous[0]) / (x-previous[0])
+                result[column] = [a+(b-a)*fraction for a,b in zip(previous[1],values)]
+        result[x] = values
+        previous = (x, values, timestamp)
+    return result
+
+
+def share_style(count):
+    """Return stable per-chart IDs and colors, with gray Other and white Free."""
+    user_colors = (96, 93, 95, 92, 94, 91, 35, 32)
+    return ([str(i+1) for i in range(count-2)] + ['O', 'F'],
+            list(user_colors[:count-2]) + [90, 97])
+
+
+def share_color(text, code, enabled):
+    return f'\033[{code}m{text}\033[0m' if enabled else text
+
+
+def share_legend(history, width, color):
+    """Keep current Top 5 names and absolute sizes readable in a compact legend."""
+    ids, colors = share_style(len(history.names))
+    lines, line = [], f'  当前 Top {min(5, len(history.current_rows))}: '
+    for index, (name, value) in enumerate(zip(history.names, history.amounts[-1])):
+        if index in (5, len(history.names)-2):
+            if line.strip():
+                lines.append(line.rstrip())
+            line = '  更多用户: ' if index == 5 and index < len(history.names)-2 else '  其他份额: '
+        entry = f'{ids[index]} {safe_text(name)} {human_bytes(value)}'
+        max_width = width - 4
+        while display_width(entry) > max_width:
+            name = name[:-1]
+            entry = f'{ids[index]} {safe_text(name)}… {human_bytes(value)}'
+        if display_width(line + entry) > width:
+            lines.append(line.rstrip())
+            line = '  '
+        line += share_color(entry, colors[index], color) + '  '
+    if line.strip():
+        lines.append(line.rstrip())
+    return lines
+
+
+def render_share_chart(source, history, start, end, *, width=80, height=15, color=False):
+    """Draw a 100-percent stacked area using eighth-block terminal cells."""
+    title = (f"磁盘份额 · {safe_text(source.get('label', source['id']))} · "
+             f'{start.astimezone():%m-%d}—{end.astimezone():%m-%d} · 0–100%')
+    if not history.times:
+        return title + '\n  此时间段尚无历史观测。\n'
+    if history.amounts[-1] is None:
+        entries = ' · '.join(f'{i} {safe_text(name)} {human_bytes(value)}'
+                             for i, (name, value) in enumerate(history.current_rows[:5], 1))
+        return title + '\n  当前快照缺少完整容量信息或统计口径不一致，暂不绘制份额。\n  当前 Top 5: ' + entries + '\n'
+    latest = share_percentages(history.amounts[-1], history.totals[-1])
+    ids, colors = share_style(len(history.names))
+    if len(ids) > height:
+        raise ValueError(f'完整份额标注至少需要 {len(ids)} 行')
+    label_texts = [f'{key}: {percent_text(value)}' for key, value in zip(ids, latest)]
+    label_width = max(8, max(map(len, label_texts)))
+    columns = max(10, width - 10 - label_width)
+    pixels = share_columns(history, start, end, columns)
+    y_ticks = {round((100-value)/100*(height-1)): f'{value}%' for value in (0,25,50,75,100)}
+    x_ticks = time_ticks(start, end, columns)
+    grid_columns = {column for column,_ in x_ticks}
+    # Labels follow component centers, shifting vertically only to avoid overlap.
+    cumulative, targets = 0.0, []
+    for index, value in enumerate(latest):
+        targets.append((min(height-1, max(0, round((1-(cumulative+value/2)/100)*(height-1)))), index))
+        cumulative += value
+    targets.sort(key=lambda item: (item[0], -item[1]))
+    rows = []
+    for desired,_ in targets:
+        rows.append(max(desired, rows[-1]+1 if rows else 0))
+    for i in range(len(rows)-1,-1,-1):
+        rows[i] = min(rows[i], height-1 if i==len(rows)-1 else rows[i+1]-1)
+    labels = {row:index for row,(_,index) in zip(rows,targets)}
+    complete = sum(value is not None for value in history.amounts)
+    lines = [title, f'  最新观测 {history.times[-1].astimezone():%m-%d %H:%M}；{complete} 个完整份额快照；以整盘容量为 100%。']
+    lower_blocks = ' ▁▂▃▄▅▆▇█'
+    for row in range(height):
+        chars = []
+        for column, values in enumerate(pixels):
+            grid = '┼' if row in y_ticks and column in grid_columns else '┄' if row in y_ticks else '┆' if column in grid_columns else ' '
+            if values is None:
+                chars.append(share_color(grid,90,color) if grid!=' ' else ' ')
+                continue
+            members = []
+            for subrow in range(8):
+                level = 100 * (1-(row+(subrow+0.5)/8)/height)
+                running = 0.0
+                member = len(values)-1
+                for index, value in enumerate(values):
+                    running += value
+                    if level < running:
+                        member = index
+                        break
+                members.append(member)
+            if not color:
+                chars.append(ids[members[4]])
+                continue
+            bottom, top = members[-1], members[0]
+            if bottom == top:
+                if grid != ' ':
+                    chars.append(f'\033[30;{colors[bottom]+10}m{grid}\033[0m')
+                else:
+                    chars.append(share_color('█',colors[bottom],True))
+            else:
+                count = 0
+                for member in reversed(members):
+                    if member != bottom:
+                        break
+                    count += 1
+                chars.append(f'\033[{colors[bottom]};{colors[top]+10}m{lower_blocks[count]}\033[0m')
+        value = share_color(label_texts[labels[row]].ljust(label_width),colors[labels[row]],color) if row in labels else ' '*label_width
+        mark = '├' if row in y_ticks else '│'
+        lines.append(f'{y_ticks.get(row, ""):>5} {mark}'+''.join(chars)+' │ '+value)
+    lines.append('      └'+''.join('┬' if column in grid_columns else '─' for column in range(columns))+'   最新份额')
+    axis = [' ']*columns
+    for column,label in x_ticks:
+        offset=max(0,min(columns-len(label),column-len(label)//2))
+        axis[offset:offset+len(label)]=label
+    lines.append('       '+''.join(axis))
+    lines.extend(share_legend(history,width,color))
+    lines.append('  未单列用量归入 O（其他/保留）；F 为空余，空白为缺测。')
+    if complete == 1:
+        lines.append('  目前只有一个完整份额快照，先显示单列；后续形成堆叠面积。')
+    return '\n'.join(lines)+'\n'
+
+
+def show(config, *, start, end, source_id=None, width=80, height=15, color=False, style="share"):
     """Read local history only; login never reads or scans network storage."""
     sources = [s for s in config['sources'] if source_id is None or s['id']==source_id]
     if not sources:
         raise ValueError('未知数据源')
     path = Path(config['database'])
     with closing(sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=1)) as connection:
+        if style == 'share':
+            return '\n'.join(render_share_chart(source, load_share_history(connection,source['id'],start,end),
+                                                   start,end,width=width,height=height,color=color) for source in sources)
         return '\n'.join(render_chart(source,*load_series(connection,source['id'],start,end),
                                       start,end,width=width,height=height,color=color) for source in sources)
 
@@ -480,6 +701,7 @@ def main(argv=None):
     parser.add_argument('command',choices=['collect','show','summary'])
     parser.add_argument('--config',type=Path,default=DEFAULT_CONFIG)
     parser.add_argument('--quiet',action='store_true',help='失败时静默退出，供登录提示使用')
+    parser.add_argument('--style', choices=['share','lines'], default='share', help='百分比堆叠图，或旧版对数曲线')
     parser.add_argument('--source',help='仅显示 home / storage / storage2')
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--days',type=int,help='过去多少天，默认14')
@@ -502,7 +724,7 @@ def main(argv=None):
                 raise ValueError('width须为40–200，height须为5–30')
             start,end = get_window(args.days,args.since,args.until,default_days=int(config.get('default_days',14)))
             color = args.color=='always' or (args.color=='auto' and sys.stdout.isatty() and 'NO_COLOR' not in os.environ)
-            print(show(config,start=start,end=end,source_id=args.source,width=args.width,height=args.height,color=color),end='')
+            print(show(config,start=start,end=end,source_id=args.source,width=args.width,height=args.height,color=color,style=args.style),end='')
         return 0
     except (OSError,ValueError,KeyError,TypeError,sqlite3.Error) as error:
         if not args.quiet:
