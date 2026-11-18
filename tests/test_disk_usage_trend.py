@@ -177,6 +177,43 @@ class TrendTest(unittest.TestCase):
                 self.assertIn(f'{index}: 1 TiB', values)
             self.assertIn('最新值', chart)
 
+    def test_free_space_parsing_and_zero(self):
+        self.assertEqual(trend.parse_free_space('🆓 剩 1.4 TiB\n'), int(1.4*1024**4))
+        self.assertEqual(trend.parse_free_space('\x1b[31m🆓 剩 0 B\x1b[0m'), 0)
+        self.assertIsNone(trend.parse_free_space(REPORT))
+
+    def test_migrate_free_space_without_changing_original_snapshots(self):
+        self.write_report(days=2)
+        trend.collect(self.config,now=NOW)
+        self.write_report('🆓 剩 256 GiB\n'+REPORT,days=1)
+        trend.collect(self.config,now=NOW)
+        with contextlib.closing(sqlite3.connect(self.config['database'])) as db:
+            db.execute('DROP TABLE disk_space');db.commit()  # old deployed schema
+            before=db.execute('SELECT * FROM snapshots ORDER BY id').fetchall()
+            _, names, _=trend.load_series(db,'home',NOW-timedelta(days=14),NOW)
+            self.assertEqual(len(names),2)
+        trend.collect(self.config,now=NOW)
+        trend.collect(self.config,now=NOW)
+        with contextlib.closing(sqlite3.connect(self.config['database'])) as db:
+            self.assertEqual(db.execute('SELECT * FROM snapshots ORDER BY id').fetchall(),before)
+            _,names,series=trend.load_series(db,'home',NOW-timedelta(days=14),NOW)
+            self.assertEqual(names[-1],('剩余空间',256*1024**3))
+            self.assertEqual(series[-1],[None,256*1024**3])
+            self.assertEqual(db.execute('SELECT count(*) FROM disk_space').fetchone()[0],1)
+
+    def test_six_series_with_free_space_keep_nine_rows(self):
+        names=[(f'user{i}',1024**4) for i in range(5)]+[('剩余空间',0)]
+        chart=trend.render_chart({'id':'home'},[NOW-timedelta(hours=1)],names,
+                                 [[value] for _,value in names],NOW-timedelta(days=14),NOW,color=True)
+        graph=[line for line in chart.splitlines() if '│' in line]
+        self.assertEqual(len(graph),9)
+        self.assertTrue(all(trend.display_width(line)<=80 for line in graph))
+        self.assertIn('6: 0 B',chart)
+        self.assertIn('\x1b[97m━ 6 剩余空间',chart)
+        self.assertIn('Top 5 + 剩余空间',chart)
+        with self.assertRaises(ValueError):
+            trend.latest_value_labels(names,39,41,5)
+
     def test_one_point_readonly_show_and_empty_period(self):
         self.write_report()
         trend.collect(self.config, now=NOW)
@@ -212,12 +249,18 @@ class TrendTest(unittest.TestCase):
             config=self.root/'etc/disk-usage-trend.json'
             custom=json.loads(config.read_text());custom['default_days']=30
             config.write_text(json.dumps(custom))
+            database=self.root/'var/lib/disk-usage-trend/history.sqlite3'
+            with contextlib.closing(sqlite3.connect(database)) as db:
+                db.execute('CREATE TABLE preserved(value INTEGER)')
+                db.execute('INSERT INTO preserved VALUES (42)');db.commit()
             old=self.root/'usr/local/libexec/disk-usage-trend.py'
             old.write_text('previous version')
             backup=installer.install(self.root)
         self.assertEqual(hook.read_text(),'original banner')
         self.assertEqual(json.loads(config.read_text())['default_days'],30)
         self.assertEqual((backup/'usr/local/libexec/disk-usage-trend.py').read_text(),'previous version')
+        with contextlib.closing(sqlite3.connect(backup/'history.sqlite3')) as db:
+            self.assertEqual(db.execute('SELECT value FROM preserved').fetchone()[0],42)
         self.assertTrue(os.access(self.root/'etc/update-motd.d/99-z-disk-trends',os.X_OK))
 
 

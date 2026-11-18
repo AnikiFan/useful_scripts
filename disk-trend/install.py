@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Install the reviewed disk trend package; use --destdir for a staging test."""
 import argparse
+from contextlib import closing
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import shutil
 import shlex
+import sqlite3
 import subprocess
 import tempfile
 
@@ -131,6 +133,11 @@ def install(root, *, activate=False):
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
     backup = root / 'var/backups/disk-usage-trend' / stamp
     backup.mkdir(parents=True, mode=0o700)
+    database = root / config['database'].lstrip('/')
+    if database.is_file():
+        with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as source_db:
+            with closing(sqlite3.connect(backup / 'history.sqlite3')) as backup_db:
+                source_db.backup(backup_db)
     manifest = {'replaced': [], 'new': []}
     for name, (data, mode) in files.items():
         path = root / name

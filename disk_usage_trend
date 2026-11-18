@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS usages (
     name TEXT NOT NULL, bytes INTEGER NOT NULL CHECK(bytes >= 0),
     rank INTEGER NOT NULL, PRIMARY KEY(snapshot_id, name));
 CREATE INDEX IF NOT EXISTS snapshot_time ON snapshots(source, timestamp_ns);
+CREATE TABLE IF NOT EXISTS disk_space (
+    snapshot_id INTEGER PRIMARY KEY REFERENCES snapshots(id) ON DELETE CASCADE,
+    free_bytes INTEGER NOT NULL CHECK(free_bytes >= 0));
 '''
 
 
@@ -43,6 +46,7 @@ class Observation:
     timestamp_ns: int
     digest: str
     rows: tuple
+    free_bytes: int | None = None
 
 
 def safe_text(value):
@@ -75,6 +79,18 @@ def parse_report(text):
     return tuple(rows)
 
 
+def parse_free_space(text):
+    """Read available filesystem space from the same report as the ranking."""
+    match = re.search(r'🆓\s*剩\s+(\d+(?:\.\d+)?)\s+(B|[KMGTPE]iB|[kMGTPE]B)\b', ANSI.sub('', text))
+    if match is None:
+        return None
+    number, unit = match.groups()
+    value = int(Decimal(number) * UNITS[unit])
+    if value > 2**63 - 1:
+        raise ValueError('剩余空间超出范围')
+    return value
+
+
 def read_observation(path, *, now=None, minimum_age=60):
     """Reject incomplete, oversized, or currently changing cache files."""
     now = now or datetime.now(UTC)
@@ -94,8 +110,9 @@ def read_observation(path, *, now=None, minimum_age=60):
         raise ValueError('报告正在更新')
     if not raw.endswith(b'\n'):
         raise ValueError('报告尚未写完')
+    text = raw.decode('utf-8')
     return Observation(after.st_mtime_ns, hashlib.sha256(raw).hexdigest(),
-                       parse_report(raw.decode('utf-8')))
+                       parse_report(text), parse_free_space(text))
 
 
 def load_config(path):
@@ -124,12 +141,19 @@ def store_observation(connection, source, observation):
     if old:
         if old[1] != observation.digest:
             raise ValueError('相同时间戳出现不同报告，未覆盖历史')
+        if observation.free_bytes is not None:
+            # Upgrade only this exact cached snapshot, never infer older values.
+            connection.execute('INSERT OR IGNORE INTO disk_space(snapshot_id,free_bytes) VALUES (?,?)',
+                               (old[0], observation.free_bytes))
         return False
     cursor = connection.execute('INSERT INTO snapshots(source,timestamp_ns,digest) VALUES (?,?,?)',
                                 (source, observation.timestamp_ns, observation.digest))
     connection.executemany('INSERT INTO usages(snapshot_id,name,bytes,rank) VALUES (?,?,?,?)',
                            [(cursor.lastrowid, name, size, rank)
                             for rank, (name, size) in enumerate(observation.rows, 1)])
+    if observation.free_bytes is not None:
+        connection.execute('INSERT INTO disk_space(snapshot_id,free_bytes) VALUES (?,?)',
+                           (cursor.lastrowid, observation.free_bytes))
     return True
 
 
@@ -195,7 +219,17 @@ def load_series(connection, source_id, start, end, *, top=5):
         values = dict(connection.execute('SELECT name,bytes FROM usages WHERE snapshot_id=?', (snapshot_id,)))
         for name in points:
             points[name].append(values.get(name))
-    return [datetime.fromtimestamp(ts/10**9, UTC) for _, ts in snapshots], names, [points[name] for name, _ in names]
+    series = [points[name] for name, _ in names]
+    # Reading a pre-upgrade database remains safe until the collector migrates it.
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='disk_space'").fetchone():
+        free = dict(connection.execute(
+            'SELECT d.snapshot_id,d.free_bytes FROM disk_space d JOIN snapshots s ON s.id=d.snapshot_id '
+            'WHERE s.source=? AND s.timestamp_ns>=? AND s.timestamp_ns<?',
+            (source_id, int(start.timestamp()*10**9), int(end.timestamp()*10**9))))
+        if snapshots[-1][0] in free:
+            names.append(('剩余空间', free[snapshots[-1][0]]))
+            series.append([free.get(snapshot_id) for snapshot_id, _ in snapshots])
+    return [datetime.fromtimestamp(ts/10**9, UTC) for _, ts in snapshots], names, series
 
 
 def human_bytes(value):
@@ -234,7 +268,7 @@ def segment(x0, y0, x1, y1):
             y0 += sy
 
 
-PALETTE = (96, 93, 95, 92, 94)
+PALETTE = (96, 93, 95, 92, 94, 97)
 BRAILLE_BITS = ((1, 8), (2, 16), (4, 32), (64, 128))
 
 
@@ -299,6 +333,8 @@ def legend_lines(names, width, color):
 
 def latest_value_labels(names, low, high, height):
     """Place latest values near their curves without overlapping label rows."""
+    if len(names) > height:
+        raise ValueError(f'显示全部最新值至少需要 {len(names)} 行；请增大 --height')
     ordered = sorted(enumerate(names, 1), key=lambda item: (-item[1][1], item[0]))
     rows = []
     for index, (_, value) in ordered:
@@ -321,7 +357,9 @@ def render_chart(source, times, names, series, start, end, *, width=80, height=9
         return title + '\n  此时间段尚无历史观测。\n'
     positive = [value for values in series for value in values if value is not None and value > 0]
     latest = times[-1].astimezone().strftime('%m-%d %H:%M')
-    info = f'  最新观测 {latest}；{len(times)} 个快照；图例为该时刻 Top {len(names)}。'
+    has_free = bool(names and names[-1][0] == '剩余空间')
+    ranking = f'Top {len(names) - int(has_free)}' + (' + 剩余空间' if has_free else '')
+    info = f'  最新观测 {latest}；{len(times)} 个快照；{ranking}。'
     if not positive:
         return title + '\n' + info + '\n  用量均为 0 B；对数轴无法显示零值。\n'
     low, high = math.floor(math.log2(min(positive))), math.ceil(math.log2(max(positive)))
@@ -372,7 +410,7 @@ def render_chart(source, times, names, series, start, end, *, width=80, height=9
         axis[offset:offset + len(stamp)] = stamp
     lines.append('            ' + ''.join(axis))
     lines.extend(legend_lines(names, width, color))
-    lines.append('  右侧为最新用量；同格重叠交替着色，缺测留空。' if color else
+    lines.append('  右侧为最新值；同格重叠交替着色，缺测/0 B 留空。' if color else
                  '  右侧编号对应图例；缺测/未上榜/0 B 曲线留空。')
     if len(times) == 1:
         lines.append('  目前只有一个真实快照，尚不能形成变化曲线；后续自动累积。')
